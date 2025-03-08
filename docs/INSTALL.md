@@ -3,7 +3,7 @@
 ## Environment
 
 ```bash
-git clone https://github.com/zju3dv/GVHMR --recursive
+git clone https://github.com/zju3dv/GVHMR
 cd GVHMR
 
 conda create -y -n gvhmr python=3.10
@@ -11,8 +11,10 @@ conda activate gvhmr
 pip install -r requirements.txt
 pip install -e .
 # to install gvhmr in other repo as editable, try adding "python.analysis.extraPaths": ["path/to/your/package"] to settings.json
+```
 
-# DPVO
+### Optional: DPVO (not recommended if you want fast inference speed)
+```bash
 cd third-party/DPVO
 wget https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip
 unzip eigen-3.4.0.zip -d thirdparty && rm -rf eigen-3.4.0.zip

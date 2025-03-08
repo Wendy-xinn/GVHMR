@@ -28,6 +28,8 @@ video_path: "${output_dir}/0_input_video.mp4"
 # Options
 static_cam: False
 verbose: False
+use_dpvo: False
+f_mm: null  # focal length of fullframe camera in mm
 
 paths:
   bbx: ${preprocess_dir}/bbx.pt

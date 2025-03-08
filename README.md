@@ -17,6 +17,11 @@
     <img src=docs/example_video/project_teaser.gif alt="animated" />
 </p>
 
+## News 🔥
+
+- [2025-03-08] By default not using DPVO. We implemented a SimpleVO, which is more efficient and compatible with GVHMR.
+- [2025-03-08] We added a new option `f_mm` to specify the focal length of the fullframe camera in mm.
+
 ## Setup
 
 Please see [installation](docs/INSTALL.md) for details.

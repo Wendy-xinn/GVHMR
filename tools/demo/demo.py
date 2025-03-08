@@ -20,7 +20,7 @@ from hmr4d.utils.video_io_utils import (
 )
 from hmr4d.utils.vis.cv2_utils import draw_bbx_xyxy_on_image_batch, draw_coco17_skeleton_batch
 
-from hmr4d.utils.preproc import Tracker, Extractor, VitPoseExtractor, SLAMModel
+from hmr4d.utils.preproc import Tracker, Extractor, VitPoseExtractor, SimpleVO
 
 from hmr4d.utils.geo.hmr_cam import get_bbx_xys_from_xyxy, estimate_K, convert_K_to_K4, create_camera_sensor
 from hmr4d.utils.geo_transform import compute_cam_angvel
@@ -42,6 +42,15 @@ def parse_args_to_cfg():
     parser.add_argument("--video", type=str, default="inputs/demo/dance_3.mp4")
     parser.add_argument("--output_root", type=str, default=None, help="by default to outputs/demo")
     parser.add_argument("-s", "--static_cam", action="store_true", help="If true, skip DPVO")
+    parser.add_argument("--use_dpvo", action="store_true", help="If true, use DPVO. By default not using DPVO.")
+    parser.add_argument(
+        "--f_mm",
+        type=float,
+        default=None,
+        help="Focal length of fullframe camera in mm. Leave it as None to use default values."
+        "For iPhone 15p, the [0.5x, 1x, 2x, 3x] lens have typical values [13, 24, 48, 77]."
+        "If the camera zoom in a lot, you can try 135, 200 or even larger values.",
+    )
     parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
     args = parser.parse_args()
 
@@ -57,6 +66,8 @@ def parse_args_to_cfg():
             f"video_name={video_path.stem}",
             f"static_cam={args.static_cam}",
             f"verbose={args.verbose}",
+            f"use_dpvo={args.use_dpvo}",
+            f"f_mm={args.f_mm}",
         ]
 
         # Allow to change output root
@@ -131,22 +142,29 @@ def run_preprocess(cfg):
     else:
         Log.info(f"[Preprocess] vit_features from {paths.vit_features}")
 
-    # Get DPVO results
+    # Get visual odometry results
     if not static_cam:  # use slam to get cam rotation
         if not Path(paths.slam).exists():
-            length, width, height = get_video_lwh(cfg.video_path)
-            K_fullimg = estimate_K(width, height)
-            intrinsics = convert_K_to_K4(K_fullimg)
-            slam = SLAMModel(video_path, width, height, intrinsics, buffer=4000, resize=0.5)
-            bar = tqdm(total=length, desc="DPVO")
-            while True:
-                ret = slam.track()
-                if ret:
-                    bar.update()
-                else:
-                    break
-            slam_results = slam.process()  # (L, 7), numpy
-            torch.save(slam_results, paths.slam)
+            if not cfg.use_dpvo:
+                simple_vo = SimpleVO(cfg.video_path, scale=0.5, step=8, method="sift", f_mm=cfg.f_mm)
+                vo_results = simple_vo.compute()  # (L, 4, 4), numpy
+                torch.save(vo_results, paths.slam)
+            else:  # DPVO
+                from hmr4d.utils.preproc.slam import SLAMModel
+
+                length, width, height = get_video_lwh(cfg.video_path)
+                K_fullimg = estimate_K(width, height)
+                intrinsics = convert_K_to_K4(K_fullimg)
+                slam = SLAMModel(video_path, width, height, intrinsics, buffer=4000, resize=0.5)
+                bar = tqdm(total=length, desc="DPVO")
+                while True:
+                    ret = slam.track()
+                    if ret:
+                        bar.update()
+                    else:
+                        break
+                slam_results = slam.process()  # (L, 7), numpy
+                torch.save(slam_results, paths.slam)
         else:
             Log.info(f"[Preprocess] slam results from {paths.slam}")
 
@@ -160,10 +178,15 @@ def load_data_dict(cfg):
         R_w2c = torch.eye(3).repeat(length, 1, 1)
     else:
         traj = torch.load(cfg.paths.slam)
-        traj_quat = torch.from_numpy(traj[:, [6, 3, 4, 5]])
-        R_w2c = quaternion_to_matrix(traj_quat).mT
-    K_fullimg = estimate_K(width, height).repeat(length, 1, 1)
-    # K_fullimg = create_camera_sensor(width, height, 26)[2].repeat(length, 1, 1)
+        if cfg.use_dpvo:  # DPVO
+            traj_quat = torch.from_numpy(traj[:, [6, 3, 4, 5]])
+            R_w2c = quaternion_to_matrix(traj_quat).mT
+        else:  # SimpleVO
+            R_w2c = torch.from_numpy(traj[:, :3, :3])
+    if cfg.f_mm is not None:
+        K_fullimg = create_camera_sensor(width, height, cfg.f_mm)[2].repeat(length, 1, 1)
+    else:
+        K_fullimg = estimate_K(width, height).repeat(length, 1, 1)
 
     data = {
         "length": torch.tensor(length),
