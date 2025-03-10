@@ -45,7 +45,7 @@ def parse_args_to_cfg():
     parser.add_argument("--use_dpvo", action="store_true", help="If true, use DPVO. By default not using DPVO.")
     parser.add_argument(
         "--f_mm",
-        type=float,
+        type=int,
         default=None,
         help="Focal length of fullframe camera in mm. Leave it as None to use default values."
         "For iPhone 15p, the [0.5x, 1x, 2x, 3x] lens have typical values [13, 24, 48, 77]."
@@ -67,8 +67,9 @@ def parse_args_to_cfg():
             f"static_cam={args.static_cam}",
             f"verbose={args.verbose}",
             f"use_dpvo={args.use_dpvo}",
-            f"f_mm={args.f_mm}",
         ]
+        if args.f_mm is not None:
+            overrides.append(f"f_mm={args.f_mm}")
 
         # Allow to change output root
         if args.output_root is not None:
