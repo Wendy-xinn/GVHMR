@@ -25,7 +25,7 @@ scikit-image
 termcolor
 einops
 imageio==2.34.1
-av  # imageio[pyav], improved performance over imageio[ffmpeg]
+av==13.0.0  # imageio[pyav], improved performance over imageio[ffmpeg]
 joblib
 
 # Diffusion
