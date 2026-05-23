@@ -35,7 +35,7 @@ joblib
 # 3D-Vision
 pytorch3d @ https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt230/pytorch3d-0.7.6-cp310-cp310-linux_x86_64.whl
 trimesh
-chumpy
+# chumpy 要加上 --no-build-isolation
 smplx
 # open3d==0.17.0
 wis3d

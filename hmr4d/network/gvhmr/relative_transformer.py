@@ -33,6 +33,7 @@ class NetworkEncoderRoPE(nn.Module):
         dropout=0.1,
         # other
         avgbeta=True,
+        dual_head=False,
     ):
         super().__init__()
 
@@ -83,6 +84,18 @@ class NetworkEncoderRoPE(nn.Module):
             self.static_conf_head = Mlp(self.latent_dim, out_features=static_conf_dim)
 
         self.avgbeta = avgbeta
+        self.dual_head = dual_head
+        # Optional dual-head (exo) outputs
+        self.final_layer_ego = None
+        self.pred_cam_head_ego = None
+        self.static_conf_head_ego = None
+        if self.dual_head:
+            self.final_layer_ego = Mlp(self.latent_dim, out_features=self.output_dim)
+            if self.pred_cam_head:
+                self.pred_cam_head_ego = Mlp(self.latent_dim, out_features=pred_cam_dim)
+            if self.static_conf_head:
+                self.static_conf_head_ego = Mlp(self.latent_dim, out_features=static_conf_dim)
+
 
     def _build_condition_embedder(self):
         latent_dim = self.latent_dim
@@ -164,17 +177,31 @@ class NetworkEncoderRoPE(nn.Module):
             betas = (sample[..., 126:136] * (~pmask[..., None])).sum(1) / length[:, None]  # (B, C)
             betas = repeat(betas, "b c -> b l c", l=L)
             sample = torch.cat([sample[..., :126], betas, sample[..., 136:]], dim=-1)
-
+        sample_ego = None
+        if self.dual_head and self.final_layer_ego is not None:
+            sample_ego = self.final_layer_ego(x)
+            if self.avgbeta:
+                betas = (sample_ego[..., 126:136] * (~pmask[..., None])).sum(1) / length[:, None]  # (B, C)
+                betas = repeat(betas, "b c -> b l c", l=L)
+                sample_ego = torch.cat([sample_ego[..., :126], betas, sample_ego[..., 136:]], dim=-1)
         # Output (extra)
         pred_cam = None
         if self.pred_cam_head:
             pred_cam = self.pred_cam_head(x)
             pred_cam = pred_cam * self.pred_cam_std + self.pred_cam_mean
             torch.clamp_min_(pred_cam[..., 0], 0.25)  # min_clamp s to 0.25 (prevent negative prediction)
+        pred_cam_ego = None
+        if self.pred_cam_head_ego is not None:
+            pred_cam_ego = self.pred_cam_head_ego(x)
+            pred_cam_ego = pred_cam_ego * self.pred_cam_std + self.pred_cam_mean
+            torch.clamp_min_(pred_cam_ego[..., 0], 0.25)
 
         static_conf_logits = None
         if self.static_conf_head:
             static_conf_logits = self.static_conf_head(x)  # (B, L, C')
+        static_conf_logits_ego = None
+        if self.static_conf_head_ego is not None:
+            static_conf_logits_ego = self.static_conf_head_ego(x)
 
         output = {
             "pred_context": x,
@@ -182,6 +209,14 @@ class NetworkEncoderRoPE(nn.Module):
             "pred_cam": pred_cam,
             "static_conf_logits": static_conf_logits,
         }
+        if sample_ego is not None:
+            output.update(
+                {
+                    "pred_x_ego": sample_ego,
+                    "pred_cam_ego": pred_cam_ego,
+                    "static_conf_logits_ego": static_conf_logits_ego,
+                }
+            )
         return output
 
 

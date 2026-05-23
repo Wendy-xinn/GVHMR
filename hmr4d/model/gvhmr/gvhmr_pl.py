@@ -33,9 +33,21 @@ class GvhmrPL(pl.LightningModule):
         optimizer=None,
         scheduler_cfg=None,
         ignored_weights_prefix=["smplx", "pipeline.endecoder"],
+        freeze_backbone=False,
+        freeze_exo_head=False,
+        freeze_ego_head=True,
+        copy_exo_to_ego=True,
     ):
         super().__init__()
         self.pipeline = instantiate(pipeline, _recursive_=False)
+        if copy_exo_to_ego:
+            self._copy_exo_to_ego()
+
+        self._set_freeze(
+            freeze_backbone=freeze_backbone,
+            freeze_exo_head=freeze_exo_head,
+            freeze_ego_head=freeze_ego_head,
+        )
         self.optimizer = instantiate(optimizer)
         self.scheduler_cfg = scheduler_cfg
 
@@ -47,6 +59,39 @@ class GvhmrPL(pl.LightningModule):
 
         # SMPLX
         self.smplx = make_smplx("supermotion_v437coco17")
+    
+    def _copy_exo_to_ego(self):
+        den = self.pipeline.denoiser3d
+        if not hasattr(den, "final_layer_ego"):
+            return
+        den.final_layer_ego.load_state_dict(den.final_layer.state_dict())
+        if hasattr(den, "pred_cam_head_ego") and den.pred_cam_head:
+            den.pred_cam_head_ego.load_state_dict(den.pred_cam_head.state_dict())
+        if hasattr(den, "static_conf_head_ego") and den.static_conf_head:
+            den.static_conf_head_ego.load_state_dict(den.static_conf_head.state_dict())
+    
+    def _set_freeze(self, freeze_backbone=False, freeze_exo_head=False, freeze_ego_head=True):
+        den = self.pipeline.denoiser3d
+
+        def _freeze_module(m, freeze):
+            if m is None:
+                return
+            for p in m.parameters():
+                p.requires_grad = not freeze
+
+        if freeze_backbone:
+            _freeze_module(den.learned_pos_linear, True)
+            _freeze_module(den.learned_pos_params, True)
+            _freeze_module(den.embed_noisyobs, True)
+            _freeze_module(den.blocks, True)
+
+        _freeze_module(den.final_layer, freeze_exo_head)
+        _freeze_module(getattr(den, "pred_cam_head", None), freeze_exo_head)
+        _freeze_module(getattr(den, "static_conf_head", None), freeze_exo_head)
+
+        _freeze_module(getattr(den, "final_layer_ego", None), freeze_ego_head)
+        _freeze_module(getattr(den, "pred_cam_head_ego", None), freeze_ego_head)
+        _freeze_module(getattr(den, "static_conf_head_ego", None), freeze_ego_head)
 
     def training_step(self, batch, batch_idx):
         B, F = batch["smpl_params_c"]["body_pose"].shape[:2]
@@ -68,7 +113,7 @@ class GvhmrPL(pl.LightningModule):
         else:
             mask_bbx_xys = batch["mask"]["bbx_xys"]
             batch["bbx_xys"][~mask_bbx_xys] = bbx_xys[~mask_bbx_xys]
-        if False:  # visualize bbx_xys from an iPhone view
+        if False:  # visualize bbx_xys from an iPhone view   可视化检查
             render_w, render_h = 120, 160  # iphone main-lens 24mm 3:4
             ratio = render_w / 1528
             offset = torch.tensor([764 - 500, 1019 - 500]).to(i_x2d)
@@ -104,7 +149,7 @@ class GvhmrPL(pl.LightningModule):
             video_output = np.concatenate(video_output, axis=1)
             save_video(video_output, output_dir / f"{batch_idx}.mp4", fps=30, quality=5)
 
-        # noisy_j3d -> project to i_j2d -> compute a bbx -> normalized kp2d [-1, 1]
+        # noisy_j3d -> project to i_j2d -> compute a bbx -> normalized kp2d [-1, 1]  让观测空间更像真实世界，不用真实的detector，而是从gt生成可控的伪检测；在val的时候就是真实的detector获得的2d关键点了
         noisy_j3d = gt_j3d + get_wham_aug_kp3d(gt_j3d.shape[:2])
         if True:
             noisy_j3d = randomly_modify_hands_legs(noisy_j3d)
@@ -115,7 +160,7 @@ class GvhmrPL(pl.LightningModule):
             legs_invisible_mask = get_invisible_legs_mask(gt_j3d.shape[:2]).cuda()  # (B, L, J)
             j2d_visible_mask[legs_invisible_mask] = False
         obs_kp2d = torch.cat([obs_i_j2d, j2d_visible_mask[:, :, :, None].float()], dim=-1)  # (B, L, J, 3)
-        obs = normalize_kp2d(obs_kp2d, batch["bbx_xys"])  # (B, L, J, 3)
+        obs = normalize_kp2d(obs_kp2d, batch["bbx_xys"])  # (B, L, J, 3)       主要是为了学习人体姿态，要避免摄像机距离、图像分辨率等的干扰
         obs[~j2d_visible_mask] = 0  # if not visible, set to (0,0,0)
         batch["obs"] = obs
 
@@ -127,7 +172,7 @@ class GvhmrPL(pl.LightningModule):
         # Set untrusted frames to False
         batch["obs"][~batch["mask"]["valid"]] = 0
 
-        if False:  # wis3d
+        if False:  # wis3d  用于调试的可视化工具
             wis3d = make_wis3d(name="debug-aug-kp3d")
             add_motion_as_lines(gt_j3d[0], wis3d, name="gt_j3d", skeleton_type="coco17")
             add_motion_as_lines(noisy_j3d[0], wis3d, name="noisy_j3d", skeleton_type="coco17")

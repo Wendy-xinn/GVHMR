@@ -73,6 +73,10 @@ class Pipeline(nn.Module):
         model_output = self.denoiser3d(length=length, **f_condition)  # pred_x, pred_cam, static_conf_logits
         decode_dict = self.endecoder.decode(model_output["pred_x"])  # (B, L, C) -> dict
         outputs.update({"model_output": model_output, "decode_dict": decode_dict})
+        decode_dict_ego = None
+        if "pred_x_ego" in model_output:
+            decode_dict_ego = self.endecoder.decode(model_output["pred_x_ego"])
+            outputs.update({"decode_dict_ego": decode_dict_ego})
 
         # Post-processing
         outputs["pred_smpl_params_incam"] = {
@@ -81,6 +85,14 @@ class Pipeline(nn.Module):
             "global_orient": decode_dict["global_orient"],  # (B, L, 3)
             "transl": compute_transl_full_cam(model_output["pred_cam"], inputs["bbx_xys"], inputs["K_fullimg"]),
         }
+        if decode_dict_ego is not None:
+            outputs["pred_smpl_params_incam_ego"] = {
+                "body_pose": decode_dict_ego["body_pose"],
+                "betas": decode_dict_ego["betas"],
+                "global_orient": decode_dict_ego["global_orient"],
+                "transl": compute_transl_full_cam(model_output["pred_cam_ego"], inputs["bbx_xys_ego"], inputs["K_fullimg"]),
+            }
+
         if not train:
             pred_smpl_params_global = get_smpl_params_w_Rt_v2(  # This function has for-loop
                 global_orient_gv=decode_dict["global_orient_gv"],
@@ -94,6 +106,20 @@ class Pipeline(nn.Module):
                 **pred_smpl_params_global,
             }
             outputs["static_conf_logits"] = model_output["static_conf_logits"]
+
+            if decode_dict_ego is not None:
+                pred_smpl_params_global_ego = get_smpl_params_w_Rt_v2(
+                    global_orient_gv=decode_dict_ego["global_orient_gv"],
+                    local_transl_vel=decode_dict_ego["local_transl_vel"],
+                    global_orient_c=decode_dict_ego["global_orient"],
+                    cam_angvel=inputs["cam_angvel_ego"],
+                )
+                outputs["pred_smpl_params_global_ego"] = {
+                    "body_pose": decode_dict_ego["body_pose"],
+                    "betas": decode_dict_ego["betas"],
+                    **pred_smpl_params_global_ego,
+                }
+                outputs["static_conf_logits_ego"] = model_output["static_conf_logits_ego"]
 
             if postproc:  # apply post-processing
                 if static_cam:  # extra post-processing to utilize static camera prior
