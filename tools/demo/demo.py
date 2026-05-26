@@ -193,7 +193,7 @@ def load_data_dict(cfg):
         "length": torch.tensor(length),
         "bbx_xys": torch.load(paths.bbx)["bbx_xys"],
         "kp2d": torch.load(paths.vitpose),
-        "K_fullimg": K_fullimg,
+        "K_fullimg": K_fullimg,     # 相机内参矩阵
         "cam_angvel": compute_cam_angvel(R_w2c),
         "f_imgseq": torch.load(paths.vit_features),
     }
