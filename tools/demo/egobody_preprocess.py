@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import cv2
 import pandas as pd
+import pickle
 
 from hmr4d.utils.pylogger import Log
 from hmr4d.utils.video_io_utils import get_video_lwh, get_writer
@@ -12,6 +13,7 @@ from hmr4d.utils.preproc import Tracker, VitPoseExtractor, Extractor
 from hmr4d.utils.geo.hmr_cam import estimate_K, create_camera_sensor
 from hmr4d.utils.geo_transform import compute_cam_angvel
 from hmr4d.utils.preproc.vitfeat_extractor import get_batch
+from hmr4d.utils.smplx_utils import make_smplx
 
 
 def parse_args():
@@ -122,7 +124,7 @@ def build_pv_inputs(pv_dir, data_info_csv):
     scale  = scale[keep]
     kpts25 = kpts25[keep]
     valid  = valid[keep]
-
+    timestamps, frame_ids = parse_name(imgname)
     # 3) build bbx_xys from center/scale
     # 这里用一个简化转换：w = h = scale * 200（可根据数据文档调整）
     bbx_xys = np.zeros((len(center), 3), dtype=np.float32)
@@ -139,7 +141,7 @@ def build_pv_inputs(pv_dir, data_info_csv):
         "spv_incam_only": False,
     }
 
-    return imgname, bbx_xys, kpts25, mask
+    return imgname, bbx_xys, kpts25, mask, timestamps, frame_ids
 
 def _make_temp_video_from_images(image_dir: Path, out_video: Path, fps: int, image_exts):
     img_paths = _collect_images(image_dir, image_exts)
@@ -254,6 +256,47 @@ def find_view3_dirs(root):
             view3.append(master_dir)
     return view3
 
+def get_split_from_csv(data_splits_csv, recording_name):
+    df = pd.read_csv(data_splits_csv)
+    # CSV 里 train/val/test 列包含 recording_name
+    for split in ["train", "val", "test"]:
+        if split in df.columns and recording_name in df[split].dropna().tolist():
+            return split
+    return None
+
+def load_smplx_pkl(pkl_path):
+    with open(pkl_path, "rb") as f:
+        data = pickle.load(f)
+    # data: dict with betas, global_orient, transl, body_pose (numpy)
+    return data
+
+def project_joints_to_2d(j3d, K):
+    z = j3d[:, 2].copy()
+    z[z < 1e-3] = 1e-3
+    u = (j3d[:, 0] * K[0, 0]) / z + K[0, 2]
+    v = (j3d[:, 1] * K[1, 1]) / z + K[1, 2]
+    vis = (j3d[:, 2] > 0.1).astype(np.float32)
+    return np.stack([u, v, vis], axis=-1)
+
+def bbox_from_j2d(j2d):
+    vis = j2d[:, 2] > 0.5
+    if vis.sum() < 3:
+        return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    xs = j2d[vis, 0]
+    ys = j2d[vis, 1]
+    cx = (xs.min() + xs.max()) / 2
+    cy = (ys.min() + ys.max()) / 2
+    size = max(xs.max() - xs.min(), ys.max() - ys.min())
+    return np.array([cx, cy, size], dtype=np.float32)
+
+def load_kinect_to_world(calib_root, recording_name):
+    # path: calibrations/RECORDING_NAME/cal_trans/kinect12_to_world/*.json
+    calib_dir = Path(calib_root) / recording_name / "cal_trans" / "kinect12_to_world"
+    json_path = sorted(list(calib_dir.glob("*.json")))[0]
+    data = json.loads(json_path.read_text())
+    T = np.array(data["trans"], dtype=np.float32)  # 4x4
+    return T
+
 def main():
     args = parse_args()
     root = Path(args.root)
@@ -274,12 +317,10 @@ def main():
         pv_txt_path = list(input_path.parent.glob("*_pv.txt"))[0]
         ego_meta, ego_per_frame = _load_ego_pv_txt(pv_txt_path)             # 第一视角相机内参是逐帧变化的
         img_paths = _collect_images(input_path, image_exts)
-        timestamps, frame_ids = parse_name(img_paths)
-        
 
         out_dir = out_root /  "view1" / input_path.relative_to(root / "egocentric_color").parts[0]
         Log.info(f"[View1] {input_path} -> {out_dir}")
-        imgname, bbx_xys, kpts25, mask = build_pv_inputs(input_path.parent, data_info_csv)
+        imgname, bbx_xys, kpts25, mask, timestamps, frame_ids = build_pv_inputs(input_path.parent, data_info_csv)
         imgs = np.stack([cv2.imread(p)[..., ::-1] for p in img_paths], axis=0)  # (F,H,W,3) RGB
         bbx_xys = torch.tensor(bbx_xys, dtype=torch.float32)                    # (F,3)
         imgs_tensor, bbx_xys_ds = get_batch(imgs, bbx_xys, path_type="np")
@@ -312,41 +353,71 @@ def main():
             "kp2d_25": torch.tensor(kpts25, dtype=torch.float32),
             "mask": mask,
             "f_imgseq": f_imgseq,
-            "imgname": imgname,
+            "frame_ids": frame_ids,    # 保持 list/np
+            "timestamps": timestamps,  # 保持 list/np
+            "imgname": imgname,      # 保持 list/np
             "K_fullimg": K_fullimg,
             "cam_angvel": cam_angvel,
         }
         _save_tensor(out_dir / "preprocess.pt", output)
      
       
-
+    smplx_model = make_smplx("supermotion").cuda()
     for input_path in view3_inputs:
-        out_dir = out_root /  "view3" / input_path.relative_to(root / "kinect_color").parts[0]
+        recording_name = input_path.relative_to(root / "kinect_color").parts[0]
+        out_dir = out_root /  "view3" / recording_name
         Log.info(f"[View3] {input_path} -> {out_dir}")
 
-    
-        tmp_video = out_dir / "_tmp_view3.mp4"
+        # 对齐第一视角和第三视角的帧
+        view1_data = torch.load(out_root / "view1" / recording_name / "preprocess.pt")
+        frame_ids_view1 = view1_data["frame_ids"].tolist()
         img_paths = _collect_images(input_path, image_exts)
-        video_path = _make_temp_video_from_images(input_path, tmp_video, fps=args.fps, image_exts=image_exts)
+        timestamps, frame_ids_view3 = parse_name(img_paths)
+        keep = np.isin(frame_ids_view3, frame_ids_view1)
+        frame_ids_view3 = frame_ids_view3[keep]
 
-        K_fullimg = None
-        if exo_K is not None:
-            length, _, _ = get_video_lwh(video_path)
-            K_fullimg = exo_K.repeat(length, 1, 1)
+        split = get_split_from_csv(root / "data_splits.csv", recording_name)
+        if split is None:
+            Log.warning(f"Cannot find split for {recording_name}, skip.")
+            continue
+        # 读取calibrations获得R_w2c
+        T_kinect_to_world = load_kinect_to_world(root / "calibrations", recording_name)
+        kp2d_exo, kp2d_ego = [], []
+        bbx_exo, bbx_ego = [], []
+        smpl_params_exo_cam, smpl_params_ego_cam = [], []
+        for fid in frame_ids_view3:
+            # 读取3d的gt
+            pkl_exo = root / f"smplx_interactee_{split}/{recording_name}/*/results/frame_{fid:05d}/000.pkl"
+            pkl_ego = root / f"smplx_camera_wearer_{split}/{recording_name}/*/results/frame_{fid:05d}/000.pkl"
+            if not pkl_exo.exists() or not pkl_ego.exists():
+                continue
+
+            exo = load_smplx_pkl(pkl_exo)
+            ego = load_smplx_pkl(pkl_ego)
+            smpl_params_exo_cam.append(exo)
+            smpl_params_ego_cam.append(ego)
+            exo_out = smplx_model(
+                betas=torch.tensor(exo["betas"]).unsqueeze(0).cuda(),
+                global_orient=torch.tensor(exo["global_orient"]).unsqueeze(0).cuda(),
+                body_pose=torch.tensor(exo["body_pose"]).unsqueeze(0).cuda(),
+                transl=torch.tensor(exo["transl"]).unsqueeze(0).cuda(),
+            )
+            ego_out = smplx_model(
+                betas=torch.tensor(ego["betas"]).unsqueeze(0).cuda(),
+                global_orient=torch.tensor(ego["global_orient"]).unsqueeze(0).cuda(),
+                body_pose=torch.tensor(ego["body_pose"]).unsqueeze(0).cuda(),
+                transl=torch.tensor(ego["transl"]).unsqueeze(0).cuda(),
+            )
+            投影到2d
+            分别获取边界框
+            
+            计算图像特征
+
+        
 
         cam_angvel = torch.zeros((len(frame_ids), 6), dtype=torch.float32) if args.static_view3 else None
 
-        _process_one_video(
-            video_path,
-            out_dir,
-            f_mm=args.f_mm_view3,
-            static_cam=args.static_view3,
-            source_type="images",
-            source_path=input_path,
-            frame_ids=frame_ids,
-            K_fullimg_override=K_fullimg,
-            cam_angvel_override=cam_angvel,
-        )
+       
         
 
 

@@ -127,7 +127,7 @@ class NetworkEncoderRoPE(nn.Module):
             length: (B), valid length of x, if None then use x.shape[2]
             f_imgseq: (B, L, C)
             f_cliffcam: (B, L, 3), CLIFF-Cam parameters (bbx-detection in the full-image)
-            f_noisyobs: (B, L, C), nosiy pose observation
+            f_noisyobs: (B, L, C), noisy pose observation
             f_cam_angvel: (B, L, 6), Camera angular velocity
         """
         B, L, J, C = obs.shape
