@@ -7,6 +7,7 @@ import cv2
 import pandas as pd
 import pickle
 from tqdm import tqdm
+import gc
 
 from hmr4d.utils.pylogger import Log
 from hmr4d.utils.video_io_utils import get_video_lwh, get_writer
@@ -114,6 +115,7 @@ def build_pv_inputs(pv_dir, data_info_csv):
     kp_npz, vf_npz = load_pv_npz(pv_dir)
 
     imgname = np.array(kp_npz["imgname"], dtype=object)        # list of image paths
+    # print(imgname)
     center = kp_npz["center"]            # (N,2)
     scale  = kp_npz["scale"]             # (N,)
     kpts25 = kp_npz["keypoints"]         # (N,25,3) (x,y,conf)
@@ -122,9 +124,11 @@ def build_pv_inputs(pv_dir, data_info_csv):
     # 2) filter by start/end frame
     recording_name = Path(pv_dir).parents[0].name  # egocentric_color/RECORDING/DATE/PV
     start_f, end_f = load_seq_info(data_info_csv, recording_name)
+    # print(start_f, end_f)
     keep = filter_by_frame_range(imgname, start_f, end_f)
 
     imgname = imgname[keep]
+    # print(imgname[:20])
     center = center[keep]
     scale  = scale[keep]
     kpts25 = kpts25[keep]
@@ -151,27 +155,27 @@ def build_pv_inputs(pv_dir, data_info_csv):
 
 def find_view1_dirs(root):
     view1 = []
-    # for seq in (root / "egocentric_color").iterdir():
-    #     if not seq.is_dir():
-    #         continue
-    #     sub_folders = [f for f in seq.iterdir() if f.is_dir()]
-    #     if not sub_folders:
-    #         continue
-    #     pv_dir = sub_folders[0] / "PV"
-    #     if pv_dir.is_dir():
-    #         view1.append(pv_dir)
-    view1.append(root / "egocentric_color" / "recording_20210907_S02_S01_01" / "2021-09-07-155421" / "PV" )
+    for seq in (root / "egocentric_color").iterdir():
+        if not seq.is_dir():
+            continue
+        sub_folders = [f for f in seq.iterdir() if f.is_dir()]
+        if not sub_folders:
+            continue
+        pv_dir = sub_folders[0] / "PV"
+        if pv_dir.is_dir():
+            view1.append(pv_dir)
+    # view1.append(root / "egocentric_color" / "recording_20210907_S02_S01_01" / "2021-09-07-155421" / "PV" )
     return view1
 
 def find_view3_dirs(root):
     view3 = []
-    # for seq in (root / "kinect_color").iterdir():
-    #     if not seq.is_dir():
-    #         continue
-    #     master_dir = seq / "master"
-    #     if master_dir.is_dir():
-    #         view3.append(master_dir)
-    view3.append(root / "kinect_color" / "recording_20210907_S02_S01_01" / "master")
+    for seq in (root / "kinect_color").iterdir():
+        if not seq.is_dir():
+            continue
+        master_dir = seq / "master"
+        if master_dir.is_dir():
+            view3.append(master_dir)
+    # view3.append(root / "kinect_color" / "recording_20210907_S02_S01_01" / "master")
     return view3
 
 def get_split_from_csv(data_splits_csv, recording_name):
@@ -212,7 +216,7 @@ def load_kinect_to_world(calib_root, recording_name):
     calib_dir = Path(calib_root) / recording_name / "cal_trans" / "kinect12_to_world"
     json_path = sorted(list(calib_dir.glob("*.json")))[0]
     data = json.loads(json_path.read_text())
-    T = np.array(data["trans"], dtype=np.float32)  # 4x4
+    T = torch.tensor(data["trans"], dtype=torch.float32)  # 4x4
     return T
 
 def xys_to_xyxy(bbx_xys):
@@ -283,10 +287,23 @@ def main():
 
         imgname, bbx_xys, kpts25, mask, timestamps, frame_ids = build_pv_inputs(input_path.parent, data_info_csv)
         img_paths = [Path(p) for p in imgname]
-        imgs = np.stack([cv2.imread(str(root / p))[..., ::-1] for p in img_paths], axis=0)  # (F,H,W,3) RGB
-        bbx_xys = torch.tensor(bbx_xys, dtype=torch.float32)                    # (F,3)
-        imgs_tensor, bbx_xys_ds = get_batch(imgs, bbx_xys, img_ds=1.0, path_type="np")
-        f_imgseq = extractor.extract_video_features(imgs_tensor, bbx_xys_ds)
+        # imgs = np.stack([cv2.imread(str(root / p))[..., ::-1] for p in img_paths], axis=0)  # (F,H,W,3) RGB    容易爆cpu内存
+        chunk = 512  # 或 128
+        f_list = []
+        for start in range(0, len(img_paths), chunk):
+            end = min(start + chunk, len(img_paths))
+            imgs = np.stack([cv2.imread(str(root / p))[..., ::-1] for p in img_paths[start:end]], axis=0)
+            imgs_t, bbx_ds = get_batch(imgs, torch.tensor(bbx_xys, dtype=torch.float32)[start:end], img_ds=1.0, path_type="np")
+            f_list.append(extractor.extract_video_features(imgs_t, bbx_ds))
+            del imgs, imgs_t, bbx_ds
+            gc.collect()
+        if not f_list:
+            print("f_list 为空，跳过当前拼接:", input_path)
+            continue
+        f_imgseq = torch.cat(f_list, dim=0)     
+        # bbx_xys = torch.tensor(bbx_xys, dtype=torch.float32)                    # (F,3)
+        # imgs_tensor, bbx_xys_ds = get_batch(imgs, bbx_xys, img_ds=1.0, path_type="np")
+        # f_imgseq = extractor.extract_video_features(imgs_tensor, bbx_xys_ds)
 
         K_fullimg = None
         cam_angvel = None
@@ -322,7 +339,11 @@ def main():
             "R_w2c": R_w2c,
         }
         _save_tensor(out_dir / "preprocess_view1.pt", output)
-     
+        Log.info(f"[View1_done] {input_path} -> {out_dir}")
+        del bbx_xys, f_imgseq, K_fullimg, cam_angvel
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
       
     smplx_model = make_smplx("supermotion").cuda()
     tracker = Tracker()
@@ -339,7 +360,7 @@ def main():
         "leye_pose",
         "reye_pose",
     ]
-    # extractor = Extractor()
+    
     for input_path in tqdm(view3_inputs, desc="[View3] sequences"):
         recording_name = input_path.relative_to(root / "kinect_color").parts[0]
         out_dir = out_root /  "view3" / recording_name
@@ -347,9 +368,12 @@ def main():
             Log.info(f"[Skip] {out_dir} already exists")
             continue
         Log.info(f"[View3] {input_path} -> {out_dir}")
-
+        view1_dir = out_root / "view1" / recording_name / "preprocess_view1.pt"
+        if not view1_dir.exists():
+            print("view1 为空，跳过当前拼接:", input_path)
+            continue
         # 对齐第一视角和第三视角的帧
-        view1_data = torch.load(out_root / "view1" / recording_name / "preprocess_view1.pt")
+        view1_data = torch.load(view1_dir)
         frame_ids_view1 = view1_data["frame_ids"].tolist()
         img_paths = _collect_images(input_path, image_exts)
         # timestamps, frame_ids_view3 = parse_name(img_paths)
@@ -369,7 +393,7 @@ def main():
             Log.warning(f"Cannot find split for {recording_name}, skip.")
             continue
         # 读取calibrations获得R_c2w
-        T_kinect_to_world = load_kinect_to_world(root / "calibrations", recording_name)
+        T_kinect_to_world = load_kinect_to_world(root / "calibrations", recording_name)  # 4x4 
         # kp2d_exo, kp2d_ego = [], []
         bbx_exo, bbx_ego = [], []
         valid_view3 = []
@@ -422,26 +446,27 @@ def main():
                 ego_params = [load_smplx_pkl(ego_pkls[i]) for i in ok_indices]
 
                 exo_inputs = {}
-                for k in smplx_keys:
-                    if k in exo_params[0]:
-                        exo_inputs[k] = torch.tensor(
-                            np.stack([p[k].squeeze(0) for p in exo_params]),
-                            dtype=torch.float32
-                        ).cuda()
-                        # print(f"{k}: {exo_inputs[k].shape}")
-                exo_out = smplx_model(**exo_inputs)
-                ego_inputs = {}
-                for k in smplx_keys:
-                    if k in ego_params[0]:
-                        ego_inputs[k] = torch.tensor(
-                            np.stack([p[k].squeeze(0) for p in ego_params]),
-                            dtype=torch.float32
-                        ).cuda()
-                ego_out = smplx_model(**ego_inputs)
+                with torch.no_grad():
+                    for k in smplx_keys:
+                        if k in exo_params[0]:
+                            exo_inputs[k] = torch.tensor(
+                                np.stack([p[k].squeeze(0) for p in exo_params]),
+                                dtype=torch.float32
+                            ).cuda()
+                            # print(f"{k}: {exo_inputs[k].shape}")
+                    exo_out = smplx_model(**exo_inputs)
+                    ego_inputs = {}
+                    for k in smplx_keys:
+                        if k in ego_params[0]:
+                            ego_inputs[k] = torch.tensor(
+                                np.stack([p[k].squeeze(0) for p in ego_params]),
+                                dtype=torch.float32
+                            ).cuda()
+                    ego_out = smplx_model(**ego_inputs)
 
                 exo_j3d = exo_out.joints.detach().cpu().numpy()
                 ego_j3d = ego_out.joints.detach().cpu().numpy()
-
+                del exo_out, ego_out
                 for k, idx in enumerate(ok_indices):
                     j2d_exo_list[idx] = project_joints_to_2d(exo_j3d[k], exo_K)
                     j2d_ego_list[idx] = project_joints_to_2d(ego_j3d[k], exo_K)
@@ -494,12 +519,28 @@ def main():
         valid_view3 = np.array(valid_view3, dtype=bool)
             
         # 计算图像特征
-        imgs = np.stack([cv2.imread(str(p))[..., ::-1] for p in img_paths], axis=0)
-        imgs_t, bbx_ds = get_batch(imgs, torch.tensor(bbx_exo, dtype=torch.float32), img_ds=1.0, path_type="np")
-        f_imgseq_exo =  extractor.extract_video_features(imgs_t, bbx_ds, img_ds=1.0)
+        # imgs = np.stack([cv2.imread(str(p))[..., ::-1] for p in img_paths], axis=0)
+        # imgs_t, bbx_ds = get_batch(imgs, torch.tensor(bbx_exo, dtype=torch.float32), img_ds=1.0, path_type="np")
+        # f_imgseq_exo =  extractor.extract_video_features(imgs_t, bbx_ds, img_ds=1.0)
 
-        imgs_t, bbx_ds = get_batch(imgs, torch.tensor(bbx_ego, dtype=torch.float32), img_ds=1.0, path_type="np")
-        f_imgseq_ego =  extractor.extract_video_features(imgs_t, bbx_ds, img_ds=1.0)
+        # imgs_t, bbx_ds = get_batch(imgs, torch.tensor(bbx_ego, dtype=torch.float32), img_ds=1.0, path_type="np")
+        # f_imgseq_ego =  extractor.extract_video_features(imgs_t, bbx_ds, img_ds=1.0)
+        chunk = 512  # 或 128
+        f_list_exo = []
+        f_list_ego = []
+        for start in range(0, len(img_paths), chunk):
+            end = min(start + chunk, len(img_paths))
+            imgs = np.stack([cv2.imread(str(root / p))[..., ::-1] for p in img_paths[start:end]], axis=0)
+            imgs_t, bbx_ds = get_batch(imgs, torch.tensor(bbx_exo, dtype=torch.float32)[start:end], img_ds=1.0, path_type="np")
+            f_list_exo.append(extractor.extract_video_features(imgs_t, bbx_ds))
+            del imgs_t, bbx_ds
+            gc.collect()
+            imgs_t, bbx_ds = get_batch(imgs, torch.tensor(bbx_ego, dtype=torch.float32)[start:end], img_ds=1.0, path_type="np")
+            f_list_ego.append(extractor.extract_video_features(imgs_t, bbx_ds))
+            del imgs, imgs_t, bbx_ds
+            gc.collect()
+        f_imgseq_exo = torch.cat(f_list_exo, dim=0) 
+        f_imgseq_ego = torch.cat(f_list_ego, dim=0) 
 
         mask_view3 = {
             "valid": np.array(valid_view3, dtype=bool),
@@ -519,13 +560,19 @@ def main():
             "f_imgseq_exo": f_imgseq_exo,
             "f_imgseq_ego": f_imgseq_ego,
             "K_fullimg": torch.from_numpy(exo_K).unsqueeze(0).repeat(len(frame_ids_view3), 1, 1),
-            "R_w2c": torch.tensor(T_kinect_to_world, dtype=torch.float32).transpose(1, 2),
+            "R_w2c": T_kinect_to_world[:3, :3].T,
             # "smplx_params_exo_cam": smpl_params_exo_cam,
             # "smplx_params_ego_cam": smpl_params_ego_cam,
-            "imgname": img_paths,  # 绝对路径
+            "imgname": np.array(img_paths, dtype=object),  # 绝对路径
             "length": len(frame_ids_view3),
         }
         _save_tensor(out_dir / "preprocess_view3.pt", output)
+        Log.info(f"[View3_done] {input_path} -> {out_dir}")
+        del f_imgseq_exo, f_imgseq_ego
+        del bbx_exo, bbx_ego
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
 
        

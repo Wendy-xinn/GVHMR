@@ -4,4 +4,7 @@
         "./outputs"
     ],
     "typeCheckingMode": "off",
+    "extraPaths": [
+        "/public/home/wenxin/GVHMR"
+    ],
 }
