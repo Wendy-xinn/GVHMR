@@ -336,7 +336,7 @@ def main():
             "imgname": imgname,      # 保持 list/np，相对路径
             "K_fullimg": K_fullimg,
             "cam_angvel": cam_angvel,
-            "R_w2c": R_w2c,
+            "R_w2c": R_w2c,   # 这里的坐标系存疑：应该不是pv直接到场景世界坐标系，而是从pv相机坐标系先转换到hololens的世界坐标系，然后再通过holo to kinect12文件转换到kinect12的坐标系，最终转换到场景世界坐标系
         }
         _save_tensor(out_dir / "preprocess_view1.pt", output)
         Log.info(f"[View1_done] {input_path} -> {out_dir}")

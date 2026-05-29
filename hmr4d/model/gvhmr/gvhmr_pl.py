@@ -37,6 +37,8 @@ class GvhmrPL(pl.LightningModule):
         freeze_exo_head=False,
         freeze_ego_head=True,
         copy_exo_to_ego=True,
+        vis_every_n_steps=500,
+        num_vis_samples=2,
     ):
         super().__init__()
         self.pipeline = instantiate(pipeline, _recursive_=False)
@@ -59,6 +61,9 @@ class GvhmrPL(pl.LightningModule):
 
         # SMPLX
         self.smplx = make_smplx("supermotion_v437coco17")
+
+        self.vis_every_n_steps = vis_every_n_steps
+        self.num_vis_samples = num_vis_samples
     
     def _copy_exo_to_ego(self):
         den = self.pipeline.denoiser3d
@@ -292,7 +297,7 @@ class GvhmrPL(pl.LightningModule):
             gt_smpl_params = {k: v[0, windows[0]] for k, v in batch["gt_smpl_params"].items()}
             gt_smplx_out = smplx_models[gender](**gt_smpl_params)
 
-            # GT (ayfz)
+            # GT (ayfz)：ay是将数据集的重力都统一为y=重力；ayfz是将数据集的重力统一为y=重力，并且人体面朝z方向，这样可以更好地观察人体的运动细节，而不受全局旋转的干扰？
             smplx_verts_ay = apply_T_on_points(gt_smplx_out.vertices, T_w2ay)
             smplx_joints_ay = apply_T_on_points(gt_smplx_out.joints, T_w2ay)
             T_ay2ayfz = compute_T_ayfz2ay(smplx_joints_ay[:1], inverse=True)[0]  # (4, 4)
