@@ -7,6 +7,7 @@ from hydra.utils import instantiate
 from hmr4d.utils.pylogger import Log
 from einops import rearrange, einsum
 from hmr4d.configs import MainStore, builds
+import cv2
 
 from hmr4d.utils.geo_transform import compute_T_ayfz2ay, apply_T_on_points
 from hmr4d.utils.wis3d_utils import make_wis3d, add_motion_as_lines
@@ -38,7 +39,6 @@ class GvhmrPL(pl.LightningModule):
         freeze_ego_head=True,
         copy_exo_to_ego=True,
         vis_every_n_steps=500,
-        num_vis_samples=2,
     ):
         super().__init__()
         self.pipeline = instantiate(pipeline, _recursive_=False)
@@ -63,7 +63,6 @@ class GvhmrPL(pl.LightningModule):
         self.smplx = make_smplx("supermotion_v437coco17")
 
         self.vis_every_n_steps = vis_every_n_steps
-        self.num_vis_samples = num_vis_samples
     
     def _copy_exo_to_ego(self):
         den = self.pipeline.denoiser3d
@@ -118,7 +117,7 @@ class GvhmrPL(pl.LightningModule):
         else:
             mask_bbx_xys = batch["mask"]["bbx_xys"]
             batch["bbx_xys"][~mask_bbx_xys] = bbx_xys[~mask_bbx_xys]
-        if False:  # visualize bbx_xys from an iPhone view   可视化检查
+        if False:  # visualize bbx_xys from an iPhone view   可视化检查（如果输入没有真实的图像）
             render_w, render_h = 120, 160  # iphone main-lens 24mm 3:4
             ratio = render_w / 1528
             offset = torch.tensor([764 - 500, 1019 - 500]).to(i_x2d)
@@ -154,6 +153,45 @@ class GvhmrPL(pl.LightningModule):
             video_output = np.concatenate(video_output, axis=1)
             save_video(video_output, output_dir / f"{batch_idx}.mp4", fps=30, quality=5)
 
+        # 训练过程 2D 检测框可视化
+        if self.logger is not None and self.global_step % self.vis_every_n_steps == 0:
+            # 1. 从 batch 中获取第一张图像的完整路径
+            # 注意: 根据你的 DataLoader 设定，batch["imgname"] 可能是一个 list 或者是 tuple
+            img_path = str(batch["imgname"][0]) 
+            
+            # 2. 读取图像
+            img = cv2.imread(img_path)
+            if img is not None:
+                # OpenCV 默认读取格式为 BGR，而 TensorBoard 需要 RGB 格式
+                # 如果不转，你在 TensorBoard 里看到的图片颜色会很诡异（人脸变蓝等）
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                
+                # 3. 提取 BBox，确保格式对应上你定义的 [cx, cy, s]
+                # 假设 batch["bbx_xys"] 的 shape 为 (B, 3) 或者是 (B, F, 3)
+                # 这里取 Batch 的第 0 个，如果 F=1，顺便取第 0 帧
+                bbx = batch["bbx_xys"][0].cpu().numpy()
+                if bbx.ndim > 1:
+                    bbx = bbx[0] 
+                    
+                cx, cy, s = bbx[0], bbx[1], bbx[2]
+                x1 = int(cx - s / 2)
+                y1 = int(cy - s / 2)
+                x2 = int(cx + s / 2)
+                y2 = int(cy + s / 2)
+
+                # 4. 使用你的逻辑绘制 BBox 和 中心点
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)  # 绿色框
+                cv2.circle(img, (int(cx), int(cy)), 4, (255, 0, 0), -1) # 红色点 (RGB下的红)
+
+                # 5. 格式转换并写入 TensorBoard
+                # img 目前是 Numpy Array (H, W, C)，TensorBoard 需要 (C, H, W)
+                img_tb = torch.from_numpy(img).permute(2, 0, 1)
+                self.logger.experiment.add_image("debug/real_image_bbox", img_tb, self.global_step)
+            else:
+                # 如果路径不对或者找不到图片，打印警告而不是直接让训练崩溃
+                print(f"\n[Warning] 可视化失败，无法读取图片: {img_path}")
+        # ========================================================
+
         # noisy_j3d -> project to i_j2d -> compute a bbx -> normalized kp2d [-1, 1]  让观测空间更像真实世界，不用真实的detector，而是从gt生成可控的伪检测；在val的时候就是真实的detector获得的2d关键点了
         noisy_j3d = gt_j3d + get_wham_aug_kp3d(gt_j3d.shape[:2])
         if True:
@@ -168,8 +206,8 @@ class GvhmrPL(pl.LightningModule):
         obs = normalize_kp2d(obs_kp2d, batch["bbx_xys"])  # (B, L, J, 3)       主要是为了学习人体姿态，要避免摄像机距离、图像分辨率等的干扰
         obs[~j2d_visible_mask] = 0  # if not visible, set to (0,0,0)
         batch["obs"] = obs
-
-        if True:  # Use some detected vitpose (presave data)
+        # batch["kp2d"] = torch.zeros(B, 17, 3)   # 训练阶段不用
+        if True:  # Use some detected vitpose (presave data)这个后面可以用VitPose检测之后再加入训练
             prob = 0.5
             mask_real_vitpose = (torch.rand(B).to(obs_kp2d) < prob) * batch["mask"]["vitpose"]
             batch["obs"][mask_real_vitpose] = normalize_kp2d(batch["kp2d"], batch["bbx_xys"])[mask_real_vitpose]

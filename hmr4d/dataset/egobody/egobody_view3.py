@@ -69,7 +69,7 @@ class EgoBodyView3Dataset(ImgfeatMotionDatasetBase):
         role="ego",  # exo or ego
         motion_frames=120,
         lazy_load=True,
-        use_kp2d="none",  # none / project (后续可扩展)
+        use_kp2d="vitpose",  
     ):
         self.root = Path(root)
         self.output_root = Path(output_root)
@@ -83,7 +83,6 @@ class EgoBodyView3Dataset(ImgfeatMotionDatasetBase):
         self._seq_lens = {}
         self._pkl_index = {}
         self._T_c2w_cache = {}
-        self._vitpose = None
 
         super().__init__()
 
@@ -153,6 +152,7 @@ class EgoBodyView3Dataset(ImgfeatMotionDatasetBase):
         role = self.role
         bbx_key = "bbx_xys_exo" if role == "exo" else "bbx_xys_ego"
         f_key = "f_imgseq_exo" if role == "exo" else "f_imgseq_ego"
+        kp2d_key = "kp2d_exo" if role == "exo" else "kp2d_ego"
 
         bbx_xys = data[bbx_key][start:end].float()
         f_imgseq = data[f_key][start:end].float()
@@ -206,12 +206,21 @@ class EgoBodyView3Dataset(ImgfeatMotionDatasetBase):
 
         # kp2d (val/test 使用 vitpose)
         if self.use_kp2d == "vitpose" and self.split in ("val", "test"):
-            if self._vitpose is None:
-                self._vitpose = VitPoseExtractor(tqdm_leave=False)
-            img_paths = np.array(data["imgname"], dtype=object)[start:end]
-            imgs_np = np.stack([cv2.imread(str(p))[..., ::-1] for p in img_paths], axis=0)
-            imgs_t, bbx_xys_ds = get_batch(imgs_np, bbx_xys.clone(), img_ds=1.0, path_type="np")
-            kp2d = self._vitpose.extract(imgs_t, bbx_xys_ds, img_ds=1.0).float()
+            kp2d_file = self.output_root / "view3" / recording / "vitpose_kp2d.pt"
+            
+            # 读取字典里存放的 key，例如 "kp2d_exo" 或 "kp2d_ego"
+            kp2d_key = f"kp2d_{role}" 
+            
+            if kp2d_file.exists():
+                kp2d_data = torch.load(kp2d_file, map_location="cpu")
+                if kp2d_key in kp2d_data:
+                    kp2d = kp2d_data[kp2d_key][start:end].float()
+                else:
+                    Log.warning(f"[{self.split}] Key {kp2d_key} missing in {kp2d_file}, filling with zeros.")
+                    kp2d = torch.zeros((end - start, 17, 3), dtype=torch.float32)
+            else:
+                Log.warning(f"[{self.split}] Kp2d file missing: {kp2d_file}, filling with zeros.")
+                kp2d = torch.zeros((end - start, 17, 3), dtype=torch.float32)
             kp2d[~torch.tensor(mask_valid)] = 0
             vitpose_flag = True
         else:

@@ -28,6 +28,7 @@ pipeline:
     args:
         endecoder_opt: ${endecoder}
         normalize_cam_angvel: True
+        vis_every_n_steps: 500
         weights:
             cr_j3d: 500.
             transl_c: 1.
@@ -78,8 +79,7 @@ pl_trainer:
   max_epochs: 200
   check_val_every_n_epoch: 5
   devices: 1
-  vis_every_n_steps: 500
-  num_vis_samples: 2
+  
 
 logger:
   _target_: pytorch_lightning.loggers.TensorBoardLogger
