@@ -128,11 +128,19 @@ def compute_transl_full_cam(pred_cam, bbx_xys, K_fullimg):
     icx = K_fullimg[..., 0, 2]
     icy = K_fullimg[..., 1, 2]
     sb = s * bbx_xys[..., 2]
-    cx = 2 * (bbx_xys[..., 0] - icx) / (sb + 1e-9)
-    cy = 2 * (bbx_xys[..., 1] - icy) / (sb + 1e-9)
-    tz = 2 * focal_length / (sb + 1e-9)
+    
+    # 添加数值保护，防止除以接近 0 的数
+    sb_safe = torch.clamp(sb, min=1e-3)
+    
+    cx = 2 * (bbx_xys[..., 0] - icx) / sb_safe
+    cy = 2 * (bbx_xys[..., 1] - icy) / sb_safe
+    tz = 2 * focal_length / sb_safe
 
     cam_t = torch.stack([tx + cx, ty + cy, tz], dim=-1)
+    
+    # 裁剪异常值
+    cam_t = torch.clamp(cam_t, min=-100, max=100)
+    
     return cam_t
 
 
@@ -169,7 +177,9 @@ def project_to_bi01(points, bbx_xys, K_fullimg):
 def perspective_projection(points, K):
     # points: (B, L, J, 3)
     # K: (B, L, 3, 3)
-    projected_points = points / points[..., -1].unsqueeze(-1)
+    z = points[..., -1].unsqueeze(-1)
+    z = torch.clamp(z, min=1e-3)  # 防止除以接近 0 的数
+    projected_points = points / z
     projected_points = torch.einsum("...ij,...kj->...ki", K, projected_points.float())
     return projected_points[..., :-1]
 

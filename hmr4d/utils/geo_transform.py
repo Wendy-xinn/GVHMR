@@ -389,7 +389,7 @@ def compute_T_ayfz2ay(joints, inverse=False):
         Log.warn("{} samples can't decide the face direction".format(I_mask.sum()))
 
     x_dir = torch.zeros_like(t_ayfz2ay)  # (B, 3)
-    x_dir[:, [0, 2]] = F.normalize(RL_xz, 2, -1)
+    x_dir[:, [0, 2]] = F.normalize(RL_xz, 2, -1).to(x_dir.dtype)
     y_dir = torch.zeros_like(x_dir)
     y_dir[..., 1] = 1  # (B, 3)
     z_dir = torch.cross(x_dir, y_dir, dim=-1)

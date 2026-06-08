@@ -114,7 +114,7 @@ class Renderer:
         if faces is not None:
             if isinstance(faces, np.ndarray):
                 faces = torch.from_numpy((faces).astype("int"))
-            self.faces = faces.unsqueeze(0).to(self.device)
+            self.faces = faces.unsqueeze(0).to(self.device).long()  # 确保是 long 类型
 
         self.initialize_camera_params(focal_length, K)
         self.lights = PointLights(device=device, location=[[0.0, 0.0, -10.0]])
@@ -171,7 +171,7 @@ class Renderer:
         device = self.device
         length, center_x, center_z = map(float, (length, center_x, center_z))
         v, f, vc, fc = map(torch.from_numpy, checkerboard_geometry(length=length, c1=center_x, c2=center_z, up="y"))
-        v, f, vc = v.to(device), f.to(device), vc.to(device)
+        v, f, vc = v.to(device).float(), f.to(device), vc.to(device).float()
         self.ground_geometry = [v, f, vc]
 
     def update_bbox(self, x3d, scale=2.0, mask=None):
@@ -247,6 +247,10 @@ class Renderer:
         :param colors (N, 3) or (N, V, 3)
         :param faces (N, F, 3), optional, otherwise self.faces is used will be used
         """
+        # 确保输入是 float32（避免 FP16 混合精度问题）
+        verts = verts.float()
+        colors = colors.float()
+        
         # Sanity check of input verts, colors and faces: (B, V, 3), (B, F, 3), (B, V, 3)
         N, V, _ = verts.shape
         if faces is None:
@@ -281,6 +285,10 @@ def create_meshes(verts, faces, colors):
     :param faces (B, F, 3)
     :param colors (B, V, 3)
     """
+    # 确保所有输入都是正确的类型
+    verts = [v.float() if isinstance(v, torch.Tensor) else v for v in verts]
+    colors = [c.float() if isinstance(c, torch.Tensor) else c for c in colors]
+    
     textures = TexturesVertex(verts_features=colors)
     meshes = Meshes(verts=verts, faces=faces, textures=textures)
     return join_meshes_as_scene(meshes)

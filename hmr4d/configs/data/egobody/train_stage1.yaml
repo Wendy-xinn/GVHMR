@@ -1,0 +1,20 @@
+_target_: hmr4d.datamodule.egobody_view.DataModule
+dataset_opts:
+  train:
+    egobody_view1_ego_train:
+      _target_: hmr4d.dataset.egobody.egobody_view1.EgoBodyView1Dataset
+      root: /public/home/wenxin/egobody
+      output_root: /public/home/wenxin/egobody/output
+      split: train
+      role: ego
+      motion_frames: 120
+      use_kp2d: vitpose
+  val:
+    egobody_view1_ego_val:
+      _target_: hmr4d.dataset.egobody.egobody_view1.EgoBodyView1Dataset
+      root: /public/home/wenxin/egobody
+      output_root: /public/home/wenxin/egobody/output
+      split: val
+      role: ego
+      motion_frames: 120
+      use_kp2d: vitpose

@@ -115,7 +115,7 @@ def convert_motion_as_line_mesh(motion, skeleton_type="smpl22", const_color=None
 
     vertices = []
     for f in range(length):
-        vertices_, faces, vertex_colors = create_skeleton_mesh(s_points[f], e_points[f], radius=0.02, color=m_colors[f])
+        vertices_, faces, vertex_colors = create_skeleton_mesh(s_points[f], e_points[f], radius=0.07, color=m_colors[f])
         vertices.append(vertices_)
     vertices = torch.stack(vertices, dim=0)
     return vertices, faces, vertex_colors
@@ -129,9 +129,15 @@ def add_motion_as_lines(motion, wis3d, name="joints22", skeleton_type="smpl22", 
     vertices, faces, vertex_colors = convert_motion_as_line_mesh(
         motion, skeleton_type=skeleton_type, const_color=const_color
     )
+    # 清理 NaN 和 Inf 值
+    vertices = torch.nan_to_num(vertices, nan=0.0, posinf=1e3, neginf=-1e3)
+    # print(len(vertices))
+    # print(torch.isnan(vertices).any())
+    # print(torch.isinf(vertices).any())
+    # print(vertices.abs().max())
     for f in range(len(vertices)):
         wis3d.set_scene_id(f + offset)
-        wis3d.add_mesh(vertices[f], faces, vertex_colors, name=name)  # Add skeleton as cylinders
+        wis3d.add_mesh(vertices[f], faces, vertex_colors, name=f"{name}_{f+offset}")  # Add skeleton as cylinders
         # Old way to add lines, this may cause problems when the number of lines is large
         # wis3d.add_lines(s_points[f], e_points[f], m_colors[f], name=name)
 
@@ -204,7 +210,7 @@ def add_joints_motion_as_spheres(joints, wis3d, radius=0.05, name="joints", labe
                 name=f"{name}",
             )
 
-
+# 生成3D骨架的mesh
 def create_skeleton_mesh(p1, p2, radius, color, resolution=4, return_merged=True):
     """
     Create mesh between p1 and p2.
@@ -226,15 +232,15 @@ def create_skeleton_mesh(p1, p2, radius, color, resolution=4, return_merged=True
     unit_seg_dir = seg_dir / seg_dir.norm(dim=-1, keepdim=True)  # (N, 3)
 
     # Compute an orthogonal vector
-    x_vec = torch.tensor([1, 0, 0], device=p1.device).float().unsqueeze(0).repeat(N, 1)  # (N, 3)
-    y_vec = torch.tensor([0, 1, 0], device=p1.device).float().unsqueeze(0).repeat(N, 1)
+    x_vec = torch.tensor([1, 0, 0], device=p1.device, dtype=p1.dtype).unsqueeze(0).repeat(N, 1)  # (N, 3)
+    y_vec = torch.tensor([0, 1, 0], device=p1.device, dtype=p1.dtype).unsqueeze(0).repeat(N, 1)
     ortho_vec = torch.cross(unit_seg_dir, x_vec, dim=-1)  # (N, 3)
     ortho_vec_ = torch.cross(unit_seg_dir, y_vec, dim=-1)  # (N, 3)  backup
     ortho_vec = torch.where(ortho_vec.norm(dim=-1, keepdim=True) > 1e-3, ortho_vec, ortho_vec_)
 
     # Get circle points on two ends
     unit_ortho_vec = ortho_vec / ortho_vec.norm(dim=-1, keepdim=True)  # (N, 3)
-    theta = torch.linspace(0, 2 * np.pi, resolution, device=p1.device)
+    theta = torch.linspace(0, 2 * np.pi, resolution, device=p1.device, dtype=p1.dtype)
     rotation_matrix = axis_angle_to_matrix(unit_seg_dir[:, None] * theta[None, :, None])  # (N, Q, 3, 3)
     rotated_points = einsum(rotation_matrix, unit_ortho_vec, "n q i j, n i -> n q j") * radius  # (N, Q, 3)
     bottom_points = rotated_points + p1.unsqueeze(1)  # (N, Q, 3)

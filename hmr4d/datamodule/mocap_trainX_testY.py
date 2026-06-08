@@ -22,7 +22,7 @@ def collate_fn(batch):
     # Assume all keys in the batch are the same
     return_dict = {}
     for k in batch[0].keys():
-        if k.startswith("meta"):  # data information, do not batch
+        if k.startswith("meta") or k == "imgname":  # data information, do not batch; imgname is list of strings
             return_dict[k] = [d[k] for d in batch]
         else:
             return_dict[k] = default_collate([d[k] for d in batch])

@@ -33,7 +33,7 @@ class NetworkEncoderRoPE(nn.Module):
         dropout=0.1,
         # other
         avgbeta=True,
-        dual_head=False,
+        dual_head=True,
     ):
         super().__init__()
 

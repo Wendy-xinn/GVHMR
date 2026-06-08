@@ -13,8 +13,8 @@ defaults:
       - lr_monitor/pl
   - _self_
 
-exp_name: egobody_view3_stage1_ego
-data_name: egobody_view3
+exp_name: egobody_view1_stage1_ego
+data_name: egobody_view1
 
 # 只训练 ego head
 model:

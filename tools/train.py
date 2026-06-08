@@ -1,4 +1,5 @@
 import hydra
+import torch
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks.checkpoint import Checkpoint
@@ -79,6 +80,7 @@ def train(cfg: DictConfig) -> None:
 @hydra.main(version_base="1.3", config_path="../hmr4d/configs", config_name="train")
 def main(cfg) -> None:
     print_cfg(cfg, use_rich=True)
+    torch.autograd.set_detect_anomaly(True)
     train(cfg)
 
 

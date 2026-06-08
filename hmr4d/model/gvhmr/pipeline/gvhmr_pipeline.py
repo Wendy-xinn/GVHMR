@@ -11,8 +11,10 @@ from hmr4d.utils.net_utils import gaussian_smooth
 from hmr4d.model.gvhmr.utils.endecoder import EnDecoder
 from hmr4d.model.gvhmr.utils.postprocess import (
     pp_static_joint,
-    process_ik,
     pp_static_joint_cam,
+    pp_static_joint_ego,
+    pp_static_joint_cam_ego,
+    process_ik,
 )
 from hmr4d.model.gvhmr.utils import stats_compose
 
@@ -86,11 +88,12 @@ class Pipeline(nn.Module):
             "transl": compute_transl_full_cam(model_output["pred_cam"], inputs["bbx_xys"], inputs["K_fullimg"]),
         }
         if decode_dict_ego is not None:
+            # 阶段A：使用 bbx_xys（数据集返回的就是 ego 的 bbox）
             outputs["pred_smpl_params_incam_ego"] = {
                 "body_pose": decode_dict_ego["body_pose"],
                 "betas": decode_dict_ego["betas"],
                 "global_orient": decode_dict_ego["global_orient"],
-                "transl": compute_transl_full_cam(model_output["pred_cam_ego"], inputs["bbx_xys_ego"], inputs["K_fullimg"]),
+                "transl": compute_transl_full_cam(model_output["pred_cam_ego"], inputs["bbx_xys"], inputs["K_fullimg"]),  # 数据集这里已经处理成ego了
             }
 
         if not train:
@@ -112,7 +115,7 @@ class Pipeline(nn.Module):
                     global_orient_gv=decode_dict_ego["global_orient_gv"],
                     local_transl_vel=decode_dict_ego["local_transl_vel"],
                     global_orient_c=decode_dict_ego["global_orient"],
-                    cam_angvel=inputs["cam_angvel_ego"],
+                    cam_angvel=inputs["cam_angvel"],
                 )
                 outputs["pred_smpl_params_global_ego"] = {
                     "body_pose": decode_dict_ego["body_pose"],
@@ -122,10 +125,18 @@ class Pipeline(nn.Module):
                 outputs["static_conf_logits_ego"] = model_output["static_conf_logits_ego"]
 
             if postproc:  # apply post-processing
+                # Exo post-processing
                 if static_cam:  # extra post-processing to utilize static camera prior
                     outputs["pred_smpl_params_global"]["transl"] = pp_static_joint_cam(outputs, self.endecoder)
                 else:
                     outputs["pred_smpl_params_global"]["transl"] = pp_static_joint(outputs, self.endecoder)
+                
+                # Ego post-processing (如果存在)
+                if decode_dict_ego is not None:
+                    if static_cam:
+                        outputs["pred_smpl_params_global_ego"]["transl"] = pp_static_joint_cam_ego(outputs, self.endecoder)
+                    else:
+                        outputs["pred_smpl_params_global_ego"]["transl"] = pp_static_joint_ego(outputs, self.endecoder)
                 body_pose = process_ik(outputs, self.endecoder)
                 decode_dict["body_pose"] = body_pose
                 outputs["pred_smpl_params_global"]["body_pose"] = body_pose
@@ -137,25 +148,61 @@ class Pipeline(nn.Module):
         total_loss = 0
         mask = inputs["mask"]["valid"]  # (B, L)
 
+        has_ego = "pred_x_ego" in model_output
+        
         # 1. Simple loss: MSE
-        pred_x = model_output["pred_x"]  # (B, L, C)
-        target_x = self.endecoder.encode(inputs)  # (B, L, C)
-        simple_loss = F.mse_loss(pred_x, target_x, reduction="none")
-        mask_simple = mask[:, :, None].expand(-1, -1, pred_x.size(2)).clone()  # (B, L, C)
-        mask_simple[inputs["mask"]["spv_incam_only"], :, 142:] = False  # 3dpw training
-        simple_loss = (simple_loss * mask_simple).mean()
-        total_loss += simple_loss
-        outputs["simple_loss"] = simple_loss
+        # Ego head loss (如果存在)
+        if has_ego:
+            pred_x_ego = model_output["pred_x_ego"]
+            if torch.isnan(pred_x_ego).any() or torch.isinf(pred_x_ego).any():
+                Log.warning("NaN/Inf found in pred_x_ego! Setting to zero.")
+                pred_x_ego = torch.nan_to_num(pred_x_ego, nan=0.0, posinf=1e3, neginf=-1e3)
+            
+            target_x = self.endecoder.encode(inputs)  # (B, L, C)
+            simple_loss_ego = F.mse_loss(pred_x_ego, target_x, reduction="none")
+            mask_simple_ego = mask[:, :, None].expand(-1, -1, pred_x_ego.size(2)).clone()
+            mask_simple_ego[inputs["mask"]["spv_incam_only"], :, 142:] = False
+            simple_loss_ego = (simple_loss_ego * mask_simple_ego).mean()
+            total_loss += simple_loss_ego
+            outputs["simple_loss_ego"] = simple_loss_ego
+        
+        # Exo head loss (如果存在且未冻结)
+        if not has_ego or not self.args.get("freeze_exo_head", False):
+            pred_x = model_output["pred_x"]
+            if torch.isnan(pred_x).any() or torch.isinf(pred_x).any():
+                Log.warning("NaN/Inf found in pred_x! Setting to zero.")
+                pred_x = torch.nan_to_num(pred_x, nan=0.0, posinf=1e3, neginf=-1e3)
+            
+            target_x = self.endecoder.encode(inputs)
+            simple_loss = F.mse_loss(pred_x, target_x, reduction="none")
+            mask_simple = mask[:, :, None].expand(-1, -1, pred_x.size(2)).clone()
+            mask_simple[inputs["mask"]["spv_incam_only"], :, 142:] = False
+            simple_loss = (simple_loss * mask_simple).mean()
+            total_loss += simple_loss
+            outputs["simple_loss"] = simple_loss
 
         # 2. Extra loss
-        extra_funcs = [
-            compute_extra_incam_loss,
-            compute_extra_global_loss,
-        ]
-        for extra_func in extra_funcs:
-            extra_loss, extra_loss_dict = extra_func(inputs, outputs, self)
-            total_loss += extra_loss
-            outputs.update(extra_loss_dict)
+        # Ego extra loss (如果存在)
+        if has_ego:
+            ego_extra_loss, ego_extra_loss_dict = compute_extra_incam_loss_ego(inputs, outputs, self)
+            total_loss += ego_extra_loss
+            outputs.update(ego_extra_loss_dict)
+            
+            # Ego global loss
+            ego_global_loss, ego_global_loss_dict = compute_extra_global_loss_ego(inputs, outputs, self)
+            total_loss += ego_global_loss
+            outputs.update(ego_global_loss_dict)
+        
+        # Exo extra loss (如果存在且未冻结)
+        if not has_ego or not self.args.get("freeze_exo_head", False):
+            extra_funcs = [
+                compute_extra_incam_loss,
+                compute_extra_global_loss,
+            ]
+            for extra_func in extra_funcs:
+                extra_loss, extra_loss_dict = extra_func(inputs, outputs, self)
+                total_loss += extra_loss
+                outputs.update(extra_loss_dict)
 
         outputs["loss"] = total_loss
         return outputs
@@ -173,6 +220,97 @@ def randomly_set_null_condition(f_condition, uncond_prob=0.1):
     return f_condition
 
 
+def compute_extra_incam_loss_ego(inputs, outputs, ppl):
+    """Ego 头的 incam loss：不使用 2D 重投影监督（第一人称视角人体大部分在画面外）"""
+    model_output = outputs["model_output"]
+    endecoder = ppl.endecoder
+    weights = ppl.weights
+
+    extra_loss_dict = {}
+    extra_loss = 0
+    mask = inputs["mask"]["valid"]
+
+    # 使用 ego 输出
+    pred_smpl_params = outputs["pred_smpl_params_incam_ego"]
+
+    # Incam FK
+    pred_c_j3d = endecoder.fk_v2(**pred_smpl_params)
+    pred_cr_j3d = pred_c_j3d - pred_c_j3d[:, :, :1]  # (B, L, J, 3)
+    
+    # GT
+    gt_c_j3d = endecoder.fk_v2(**inputs["smpl_params_c"])
+    gt_cr_j3d = gt_c_j3d - gt_c_j3d[:, :, :1]
+
+    # Root aligned C-MPJPE Loss
+    if weights.cr_j3d > 0.0:
+        cr_j3d_loss = F.mse_loss(pred_cr_j3d, gt_cr_j3d, reduction="none")
+        cr_j3d_loss = (cr_j3d_loss * mask[..., None, None]).mean()
+        extra_loss += cr_j3d_loss * weights.cr_j3d
+        extra_loss_dict["cr_j3d_loss_ego"] = cr_j3d_loss
+
+    # Ego 头不使用 transl_c loss（重投影无意义）
+    # Ego 头不使用 j2d loss（重投影无意义）
+
+    # 3D 顶点 loss（root-aligned）
+    if weights.cr_verts > 0:
+        pred_c_verts437, pred_c_j17 = endecoder.smplx_model(**pred_smpl_params)
+        root_ = pred_c_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
+        pred_cr_verts437 = pred_c_verts437 - root_
+
+        gt_cr_verts437 = inputs["gt_cr_verts437"]
+        cr_vert_loss = F.mse_loss(pred_cr_verts437, gt_cr_verts437, reduction="none")
+        cr_vert_loss = (cr_vert_loss * mask[:, :, None, None]).mean()
+        extra_loss += cr_vert_loss * weights.cr_verts
+        extra_loss_dict["cr_verts_loss_ego"] = cr_vert_loss
+
+    # Ego 头不使用 verts2d loss（重投影无意义）
+
+    return extra_loss, extra_loss_dict
+
+
+def compute_extra_global_loss_ego(inputs, outputs, ppl):
+    """Ego 头的 global loss：主要监督全局位置和静态置信度"""
+    decode_dict_ego = outputs["decode_dict_ego"]
+    endecoder = ppl.endecoder
+    weights = ppl.weights
+    args = ppl.args
+
+    extra_loss_dict = {}
+    extra_loss = 0
+    mask = inputs["mask"]["valid"].clone()
+    mask[inputs["mask"]["spv_incam_only"]] = False
+
+    model_output = outputs["model_output"]
+    static_conf_logits_ego = model_output["static_conf_logits_ego"]
+
+    if weights.transl_w > 0:
+        gt_transl_w = inputs["smpl_params_w"]["transl"]
+        gt_global_orient_w = inputs["smpl_params_w"]["global_orient"]
+        local_transl_vel = decode_dict_ego["local_transl_vel"]
+        pred_transl_w = rollout_local_transl_vel(local_transl_vel, gt_global_orient_w, gt_transl_w[:, [0]])
+
+        trans_w_loss = F.l1_loss(pred_transl_w, gt_transl_w, reduction="none")
+        trans_w_loss = (trans_w_loss * mask[..., None]).mean()
+        extra_loss += trans_w_loss * weights.transl_w
+        extra_loss_dict["transl_w_loss_ego"] = trans_w_loss
+
+    # Static-Conf loss
+    if weights.static_conf_bce > 0:
+        vel_thr = args.static_conf.vel_thr
+        assert vel_thr > 0
+        joint_ids = [7, 10, 8, 11, 20, 21]
+        gt_w_j3d = endecoder.fk_v2(**inputs["smpl_params_w"])
+        static_gt = get_static_joint_mask(gt_w_j3d, vel_thr=vel_thr, repeat_last=True)
+        static_gt = static_gt[:, :, joint_ids].float()
+
+        static_conf_loss = F.binary_cross_entropy_with_logits(static_conf_logits_ego, static_gt, reduction="none")
+        static_conf_loss = (static_conf_loss * mask[..., None]).mean()
+        extra_loss += static_conf_loss * weights.static_conf_bce
+        extra_loss_dict["static_conf_loss_ego"] = static_conf_loss
+
+    return extra_loss, extra_loss_dict
+
+
 def compute_extra_incam_loss(inputs, outputs, ppl):
     model_output = outputs["model_output"]
     decode_dict = outputs["decode_dict"]
@@ -185,11 +323,16 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
     mask = inputs["mask"]["valid"]  # effective length mask
     mask_reproj = ~inputs["mask"]["spv_incam_only"]  # do not supervise reproj for 3DPW
 
+    # Exo head only (no ego fallback)
+    pred_smpl_params = outputs["pred_smpl_params_incam"]
+    pred_cam = model_output["pred_cam"]
+
     # Incam FK
     # prediction
-    pred_c_j3d = endecoder.fk_v2(**outputs["pred_smpl_params_incam"])
+    pred_c_j3d = endecoder.fk_v2(**pred_smpl_params)
     pred_cr_j3d = pred_c_j3d - pred_c_j3d[:, :, :1]  # (B, L, J, 3)
-
+    if torch.isnan(pred_c_j3d).any() or torch.isinf(pred_c_j3d).any():
+        Log.warning("NaN/Inf in pred_c_j3d!")
     # gt
     gt_c_j3d = endecoder.fk_v2(**inputs["smpl_params_c"])  # (B, L, J, 3)
     gt_cr_j3d = gt_c_j3d - gt_c_j3d[:, :, :1]  # (B, L, J, 3)
@@ -209,7 +352,6 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
         # transl_c_loss = (transl_c_loss * mask[..., None]).mean()
 
         # Instead of supervising transl, we convert gt to pred_cam (prevent divide 0)
-        pred_cam = model_output["pred_cam"]  # (B, L, 3)
         gt_transl = inputs["smpl_params_c"]["transl"]  # (B, L, 3)
         gt_pred_cam = get_a_pred_cam(gt_transl, inputs["bbx_xys"], inputs["K_fullimg"])  # (B, L, 3)
         gt_pred_cam[gt_pred_cam.isinf()] = -1  # this will be handled by valid_mask
@@ -261,7 +403,7 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
 
     if weights.cr_verts > 0:
         # SMPL forward
-        pred_c_verts437, pred_c_j17 = endecoder.smplx_model(**outputs["pred_smpl_params_incam"])
+        pred_c_verts437, pred_c_j17 = endecoder.smplx_model(**pred_smpl_params)
         root_ = pred_c_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
         pred_cr_verts437 = pred_c_verts437 - root_
 
@@ -313,6 +455,10 @@ def compute_extra_global_loss(inputs, outputs, ppl):
     mask = inputs["mask"]["valid"].clone()  # (B, L)
     mask[inputs["mask"]["spv_incam_only"]] = False
 
+    # Exo head only (no ego fallback)
+    model_output = outputs["model_output"]
+    static_conf_logits = model_output["static_conf_logits"]
+
     if weights.transl_w > 0:
         # compute pred_transl_w by rollout
         gt_transl_w = inputs["smpl_params_w"]["transl"]
@@ -334,7 +480,7 @@ def compute_extra_global_loss(inputs, outputs, ppl):
         gt_w_j3d = endecoder.fk_v2(**inputs["smpl_params_w"])  # (B, L, J=22, 3)
         static_gt = get_static_joint_mask(gt_w_j3d, vel_thr=vel_thr, repeat_last=True)  # (B, L, J)
         static_gt = static_gt[:, :, joint_ids].float()  # (B, L, J')
-        pred_static_conf_logits = outputs["model_output"]["static_conf_logits"]
+        pred_static_conf_logits = static_conf_logits
 
         static_conf_loss = F.binary_cross_entropy_with_logits(pred_static_conf_logits, static_gt, reduction="none")
         static_conf_loss = (static_conf_loss * mask[..., None]).mean()

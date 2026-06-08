@@ -158,6 +158,16 @@ class EgoBodyView3Dataset(ImgfeatMotionDatasetBase):
         f_imgseq = data[f_key][start:end].float()
         K_fullimg = data["K_fullimg"][start:end].float()
         frame_ids = np.array(data["frame_ids"])[start:end]
+        
+        # 加载 imgname（图像路径）
+        if "imgname" in data:
+            imgname_all = data["imgname"]
+            if isinstance(imgname_all, np.ndarray):
+                imgname = [str(p) for p in imgname_all[start:end]]
+            else:
+                imgname = [str(p) for p in list(imgname_all)[start:end]]
+        else:
+            imgname = []
 
         mask_valid = np.array(data["mask"]["valid"])[start:end].astype(bool)
 
@@ -206,7 +216,7 @@ class EgoBodyView3Dataset(ImgfeatMotionDatasetBase):
 
         # kp2d (val/test 使用 vitpose)
         if self.use_kp2d == "vitpose" and self.split in ("val", "test"):
-            kp2d_file = self.output_root / "view3" / recording / "vitpose_kp2d.pt"
+            kp2d_file = self.root / "vitpose" / "view3" / recording / "vitpose_kp2d.pt"
             
             # 读取字典里存放的 key，例如 "kp2d_exo" 或 "kp2d_ego"
             kp2d_key = f"kp2d_{role}" 
@@ -233,12 +243,13 @@ class EgoBodyView3Dataset(ImgfeatMotionDatasetBase):
             "smpl_params_c": smpl_params_c,
             "smpl_params_w": smpl_params_w,
             "R_c2gv": R_c2gv,
-            "gravity_vec": torch.tensor([0.0, 0.0, -1.0]),
+            "gravity_vec": torch.tensor([0.0, -1.0, 0.0]),
             "bbx_xys": bbx_xys,
             "K_fullimg": K_fullimg,
             "f_imgseq": f_imgseq,
             "kp2d": kp2d,
             "cam_angvel": cam_angvel,
+            "imgname": imgname,
             "mask": {
                 "valid": torch.tensor(mask_valid, dtype=torch.bool),
                 "vitpose": vitpose_flag,
