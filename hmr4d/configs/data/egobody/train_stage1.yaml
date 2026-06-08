@@ -9,6 +9,7 @@ dataset_opts:
       role: ego
       motion_frames: 120
       use_kp2d: vitpose
+      overfit_single_sample: false  # 设置为 true 进行过拟合训练
   val:
     egobody_view1_ego_val:
       _target_: hmr4d.dataset.egobody.egobody_view1.EgoBodyView1Dataset

@@ -22,7 +22,8 @@ model:
   freeze_exo_head: true
   freeze_ego_head: false
   copy_exo_to_ego: true
-  vis_every_n_steps: 50
+  vis_every_n_steps: 100
+  val_vis_every_n_batches: 1  # 验证集可视化间隔（每隔 N 个 batch 可视化一次）
 
 pipeline:
     _target_: hmr4d.model.gvhmr.pipeline.gvhmr_pipeline.Pipeline
@@ -56,7 +57,7 @@ data:
 pl_trainer:
   # precision: 32
   precision: 16-mixed
-  log_every_n_steps: 10
+  log_every_n_steps: 1
   gradient_clip_val: 0.5
   max_epochs: 200
   check_val_every_n_epoch: 5

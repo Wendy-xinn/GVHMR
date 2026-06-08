@@ -26,7 +26,9 @@ def _load_kinect_to_world(calib_root, recording_name):
 
 
 def _load_holo_to_kinect(calib_root, recording_name):
-    """加载 holo → kinect12 的变换矩阵"""
+    """
+    加载 kinect12 → holo 的变换矩阵
+    """
     calib_path = Path(calib_root) / recording_name / "cal_trans" / "holo_to_kinect12.json"
     if not calib_path.exists():
         Log.warning(f"[EgoBodyView1] holo_to_kinect12.json not found: {calib_path}")
@@ -35,6 +37,7 @@ def _load_holo_to_kinect(calib_root, recording_name):
         holo_to_kinect = json.load(f)
     T_h2k = np.array(holo_to_kinect['trans'], dtype=np.float32)  # (4,4) holo → kinect
     T_k2h = np.linalg.inv(T_h2k)  # kinect → holo
+    # T_k2h = np.array(holo_to_kinect['trans'], dtype=np.float32)  # (4,4) kinect → holo
     return torch.tensor(T_k2h, dtype=torch.float32)  # kinect → holo
 
 
@@ -107,13 +110,14 @@ def _load_pv_txt(recording_name: str, root: Path, imgname_slice: List[str]):
     lines = [l.strip() for l in pv_txt_path.read_text().splitlines() if l.strip()]
     cx, cy, w, h = [float(x) for x in lines[0].split(",")]
     
-    # 解析每帧数据
+    # 解析每帧数据，使用 str→int 避免 float 精度丢失
+    # （timestamp 有 18 位数字，float64 只有 ~15-16 位有效数字，直接 float() 会丢失精度导致匹配失败）
     per_frame = {}
     for line in lines[1:]:
-        vals = [float(x) for x in line.split(",")]
-        timestamp = int(vals[0])
-        fx, fy = vals[1], vals[2]
-        pv2world = np.array(vals[3:]).reshape(4, 4)
+        parts = line.split(",")
+        timestamp = int(parts[0].strip())  # 直接 str→int，避免 float 精度丢失
+        fx, fy = float(parts[1]), float(parts[2])
+        pv2world = np.array([float(x) for x in parts[3:]]).reshape(4, 4)
         per_frame[timestamp] = {"fx": fx, "fy": fy, "pv2world": pv2world}
     
     # 从 imgname 中提取 timestamps
@@ -124,23 +128,20 @@ def _load_pv_txt(recording_name: str, root: Path, imgname_slice: List[str]):
         ts_str = stem.split("_frame_")[0]
         timestamps.append(int(ts_str))
     
-    # 根据 timestamps 构建 T_w2c 和 K
+    # 根据 timestamps 构建 T_w2c 和 K（精确匹配，fallback 到最近邻）
+    pv_ts_keys = np.array(list(per_frame.keys()), dtype=np.int64)
     T_w2c_list = []
     K_list = []
     
-    # 使用第一个可用的 timestamp 作为 fallback
-    default_key = list(per_frame.keys())[0] if per_frame else None
-    
     for ts in timestamps:
-        meta = per_frame.get(ts, per_frame.get(default_key, None))
+        meta = per_frame.get(ts, None)
         if meta is None:
-            # fallback: 使用单位矩阵
-            T_w2c_list.append(np.eye(4, dtype=np.float32))
-            K_list.append(np.eye(3, dtype=np.float32))
-            continue
+            # fallback: 最近邻匹配
+            idx = np.argmin(np.abs(pv_ts_keys - ts))
+            meta = per_frame[int(pv_ts_keys[idx])]
         
-        pv2world = meta["pv2world"]  # (4,4) PV → world
-        world2pv = np.linalg.inv(pv2world)  # world → PV
+        pv2world = meta["pv2world"]  # (4,4) PV → world (c2w), HoloLens convention
+        world2pv = np.linalg.inv(pv2world)  # world → PV (HoloLens convention)
         T_w2c_list.append(world2pv)
         
         fx, fy = meta["fx"], meta["fy"]
@@ -175,7 +176,8 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         role="ego",  # exo or ego
         motion_frames=120,
         lazy_load=True,
-        use_kp2d="vitpose",  
+        use_kp2d="vitpose",
+        overfit_single_sample=False,  # 过拟合训练：只使用第一个样本
     ):
         self.root = Path(root)
         self.output_root = Path(output_root)
@@ -184,6 +186,7 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         self.motion_frames = motion_frames
         self.lazy_load = lazy_load
         self.use_kp2d = use_kp2d
+        self.overfit_single_sample = overfit_single_sample
 
         self._preproc_paths = {}
         self._seq_lens = {}
@@ -218,6 +221,10 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         for r in self.recordings:
             L = self._seq_lens[r]
             num_samples = max(L // self.motion_frames, 1)
+            if self.overfit_single_sample:
+                # 过拟合训练：只使用第一个 recording 的第一个样本
+                self.idx2meta.extend([r] * 1)
+                return
             self.idx2meta.extend([r] * num_samples)
 
     def _build_pkl_index(self, recording_name: str, role: str):
@@ -265,7 +272,7 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
 
         for fid, v in zip(frame_ids, mask_valid):
             pkl_path = pkl_map.get(int(fid), None)
-            if pkl_path is None or not v:
+            if pkl_path is None:   #or not v:
                 body_pose.append(np.zeros((63,), dtype=np.float32))
                 betas.append(np.zeros((10,), dtype=np.float32))
                 global_orient.append(np.zeros((3,), dtype=np.float32))
@@ -295,7 +302,11 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         if target_length > length:
             start, end = 0, length
         else:
-            start = np.random.randint(0, length - target_length + 1)
+            if self.overfit_single_sample:
+                # 过拟合训练：固定使用第一个 120 帧片段
+                start = 0
+            else:
+                start = np.random.randint(0, length - target_length + 1)
             end = start + target_length
 
         # View1 始终使用 ego 的图像特征和 bbox (PV 相机视角)
@@ -319,11 +330,12 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         T_w2c, K_from_pv = _load_pv_txt(recording, self.root, imgname)
         
         # 如果 PV 文件读取失败，fallback 到 preprocess 中的 K_fullimg
-        if K_from_pv is not None:
-            K_fullimg = K_from_pv
-        else:
-            K_fullimg = data["K_fullimg"][start:end].float()
-            T_w2c = None
+        # if K_from_pv is not None:
+        #     K_fullimg = K_from_pv
+        # else:
+        #     K_fullimg = data["K_fullimg"][start:end].float()
+        #     T_w2c = None
+        K_fullimg = data["K_fullimg"][start:end].float()
 
         mask_valid = np.array(data["mask"]["valid"])[start:end].astype(bool)
 
@@ -344,10 +356,26 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
             T_kinect2holo = torch.eye(4, dtype=torch.float32)
 
         # Step 2: holo world → PV camera (使用从 PV 文件读取的 T_w2c)
+        # 注意：HoloLens PV 相机使用右手坐标系 (X-right, Y-up, Z-backward)
+        # 需要翻转 Z 轴使 Z > 0 表示物体在相机前方（适配标准透视投影）
         if T_w2c is not None:
-            # 逐帧转换: world → PV camera
-            R_w2c = T_w2c[:, :3, :3]  # (F, 3, 3)
-            t_w2c = T_w2c[:, :3, 3]   # (F, 3)
+            # HoloLens → 标准相机坐标系转换矩阵 (翻转 Y 和 Z 轴)
+            # HoloLens: X-right, Y-up, Z-backward
+            # 标准相机: X-right, Y-down, Z-forward
+            # x_std = x_holo, y_std = -y_holo, z_std = -z_holo
+            T_flip_yz = torch.tensor([
+                [1,  0,  0],
+                [0, -1,  0],
+                [0,  0, -1]
+            ], dtype=torch.float32)
+            
+            # 逐帧转换: world → PV camera (HoloLens) → 标准相机坐标系
+            R_w2c_holo = T_w2c[:, :3, :3]  # (F, 3, 3) world → PV (HoloLens)
+            t_w2c_holo = T_w2c[:, :3, 3]   # (F, 3)
+            
+            # 转换到标准相机坐标系 (翻转 Y 和 Z 轴)
+            R_w2c = T_flip_yz @ R_w2c_holo  # (F, 3, 3)
+            t_w2c = t_w2c_holo * torch.tensor([1, -1, -1], dtype=torch.float32)  # (F, 3) 翻转 y, z 分量
             
             R_w = _aa_to_mat(smpl_params_w["global_orient"])  # (F, 3, 3)
             R_c = R_w2c @ R_w  # (F, 3, 3)
@@ -377,12 +405,23 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
             interactee_smpl_kinect = self._load_smpl_params_for_role(
                 recording, interactee_role, frame_ids, mask_valid
             )
+            
             if T_kinect2holo is not None:
                 interactee_smpl_params_w = _transform_c2w(interactee_smpl_kinect, T_kinect2holo)
             
             if T_w2c is not None:
-                R_w2c = T_w2c[:, :3, :3]
-                t_w2c = T_w2c[:, :3, 3]
+                # 同样的 YZ 轴翻转
+                T_flip_yz = torch.tensor([
+                    [1,  0,  0],
+                    [0, -1,  0],
+                    [0,  0, -1]
+                ], dtype=torch.float32)
+                
+                R_w2c_holo = T_w2c[:, :3, :3]
+                t_w2c_holo = T_w2c[:, :3, 3]
+                
+                R_w2c = T_flip_yz @ R_w2c_holo
+                t_w2c = t_w2c_holo * torch.tensor([1, -1, -1], dtype=torch.float32)
                 
                 R_w = _aa_to_mat(interactee_smpl_params_w["global_orient"])
                 R_c = R_w2c @ R_w

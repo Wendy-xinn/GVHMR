@@ -18,6 +18,13 @@ from hmr4d.model.gvhmr.utils.postprocess import (
 )
 from hmr4d.model.gvhmr.utils import stats_compose
 
+
+def safe_masked_mean(loss, mask):
+    """计算 masked mean，防止 mask 全为 False 时得到 NaN"""
+    loss = loss * mask
+    num_valid = mask.sum()
+    return loss.sum() / torch.clamp(num_valid, min=1)
+
 from pytorch3d.transforms import (
     matrix_to_rotation_6d,
     rotation_6d_to_matrix,
@@ -244,7 +251,7 @@ def compute_extra_incam_loss_ego(inputs, outputs, ppl):
     # Root aligned C-MPJPE Loss
     if weights.cr_j3d > 0.0:
         cr_j3d_loss = F.mse_loss(pred_cr_j3d, gt_cr_j3d, reduction="none")
-        cr_j3d_loss = (cr_j3d_loss * mask[..., None, None]).mean()
+        cr_j3d_loss = safe_masked_mean(cr_j3d_loss, mask[..., None, None])
         extra_loss += cr_j3d_loss * weights.cr_j3d
         extra_loss_dict["cr_j3d_loss_ego"] = cr_j3d_loss
 
@@ -259,7 +266,7 @@ def compute_extra_incam_loss_ego(inputs, outputs, ppl):
 
         gt_cr_verts437 = inputs["gt_cr_verts437"]
         cr_vert_loss = F.mse_loss(pred_cr_verts437, gt_cr_verts437, reduction="none")
-        cr_vert_loss = (cr_vert_loss * mask[:, :, None, None]).mean()
+        cr_vert_loss = safe_masked_mean(cr_vert_loss, mask[:, :, None, None])
         extra_loss += cr_vert_loss * weights.cr_verts
         extra_loss_dict["cr_verts_loss_ego"] = cr_vert_loss
 
@@ -290,7 +297,7 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
         pred_transl_w = rollout_local_transl_vel(local_transl_vel, gt_global_orient_w, gt_transl_w[:, [0]])
 
         trans_w_loss = F.l1_loss(pred_transl_w, gt_transl_w, reduction="none")
-        trans_w_loss = (trans_w_loss * mask[..., None]).mean()
+        trans_w_loss = safe_masked_mean(trans_w_loss, mask[..., None])
         extra_loss += trans_w_loss * weights.transl_w
         extra_loss_dict["transl_w_loss_ego"] = trans_w_loss
 
@@ -304,7 +311,7 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
         static_gt = static_gt[:, :, joint_ids].float()
 
         static_conf_loss = F.binary_cross_entropy_with_logits(static_conf_logits_ego, static_gt, reduction="none")
-        static_conf_loss = (static_conf_loss * mask[..., None]).mean()
+        static_conf_loss = safe_masked_mean(static_conf_loss, mask[..., None])
         extra_loss += static_conf_loss * weights.static_conf_bce
         extra_loss_dict["static_conf_loss_ego"] = static_conf_loss
 
@@ -334,13 +341,13 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
     if torch.isnan(pred_c_j3d).any() or torch.isinf(pred_c_j3d).any():
         Log.warning("NaN/Inf in pred_c_j3d!")
     # gt
-    gt_c_j3d = endecoder.fk_v2(**inputs["smpl_params_c"])  # (B, L, J, 3)
+    gt_c_j3d = endecoder.fk_v2(**inputs["interactee_smpl_params_c"])  # (B, L, J, 3)
     gt_cr_j3d = gt_c_j3d - gt_c_j3d[:, :, :1]  # (B, L, J, 3)
 
     # Root aligned C-MPJPE Loss
     if weights.cr_j3d > 0.0:
         cr_j3d_loss = F.mse_loss(pred_cr_j3d, gt_cr_j3d, reduction="none")
-        cr_j3d_loss = (cr_j3d_loss * mask[..., None, None]).mean()
+        cr_j3d_loss = safe_masked_mean(cr_j3d_loss, mask[..., None, None])
         extra_loss += cr_j3d_loss * weights.cr_j3d
         extra_loss_dict["cr_j3d_loss"] = cr_j3d_loss
 
@@ -352,7 +359,7 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
         # transl_c_loss = (transl_c_loss * mask[..., None]).mean()
 
         # Instead of supervising transl, we convert gt to pred_cam (prevent divide 0)
-        gt_transl = inputs["smpl_params_c"]["transl"]  # (B, L, 3)
+        gt_transl = inputs["interactee_smpl_params_c"]["transl"]  # (B, L, 3)
         gt_pred_cam = get_a_pred_cam(gt_transl, inputs["bbx_xys"], inputs["K_fullimg"])  # (B, L, 3)
         gt_pred_cam[gt_pred_cam.isinf()] = -1  # this will be handled by valid_mask
         # (compute_transl_full_cam(gt_pred_cam, inputs["bbx_xys"], inputs["K_fullimg"]) - gt_transl).abs().max()
@@ -370,7 +377,7 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
             * (inputs["bbx_xys"][..., 2] > 0)
         )[..., None]
         transl_c_loss = F.mse_loss(pred_cam, gt_pred_cam, reduction="none")
-        transl_c_loss = (transl_c_loss * mask[..., None] * valid_mask).mean()
+        transl_c_loss = safe_masked_mean(transl_c_loss, mask[..., None] * valid_mask)
 
         extra_loss_dict["transl_c_loss"] = transl_c_loss
         extra_loss += transl_c_loss * weights.transl_c
@@ -396,7 +403,7 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
         )[..., None]
         valid_mask[~mask_reproj] = False  # Do not supervise on 3dpw
         j2d_loss = F.mse_loss(pred_j2d_01, gt_j2d_01, reduction="none")
-        j2d_loss = (j2d_loss * mask[..., None, None] * valid_mask).mean()
+        j2d_loss = safe_masked_mean(j2d_loss, mask[..., None, None] * valid_mask)
 
         extra_loss += j2d_loss * weights.j2d
         extra_loss_dict["j2d_loss"] = j2d_loss
@@ -409,7 +416,7 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
 
         gt_cr_verts437 = inputs["gt_cr_verts437"]  # (B, L, 437, 3)
         cr_vert_loss = F.mse_loss(pred_cr_verts437, gt_cr_verts437, reduction="none")
-        cr_vert_loss = (cr_vert_loss * mask[:, :, None, None]).mean()
+        cr_vert_loss = safe_masked_mean(cr_vert_loss, mask[:, :, None, None])
         extra_loss += cr_vert_loss * weights.cr_verts
         extra_loss_dict["cr_vert_loss"] = cr_vert_loss
 
@@ -436,7 +443,7 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
         )[..., None]
         valid_mask[~mask_reproj] = False  # Do not supervise on 3dpw
         verts2d_loss = F.mse_loss(pred_verts2d_01, gt_verts2d_01, reduction="none")
-        verts2d_loss = (verts2d_loss * mask[..., None, None] * valid_mask).mean()
+        verts2d_loss = safe_masked_mean(verts2d_loss, mask[..., None, None] * valid_mask)
 
         extra_loss += verts2d_loss * weights.verts2d
         extra_loss_dict["verts2d_loss"] = verts2d_loss
@@ -461,13 +468,13 @@ def compute_extra_global_loss(inputs, outputs, ppl):
 
     if weights.transl_w > 0:
         # compute pred_transl_w by rollout
-        gt_transl_w = inputs["smpl_params_w"]["transl"]
-        gt_global_orient_w = inputs["smpl_params_w"]["global_orient"]
+        gt_transl_w = inputs["interactee_smpl_params_w"]["transl"]
+        gt_global_orient_w = inputs["interactee_smpl_params_w"]["global_orient"]
         local_transl_vel = decode_dict["local_transl_vel"]
         pred_transl_w = rollout_local_transl_vel(local_transl_vel, gt_global_orient_w, gt_transl_w[:, [0]])
 
         trans_w_loss = F.l1_loss(pred_transl_w, gt_transl_w, reduction="none")
-        trans_w_loss = (trans_w_loss * mask[..., None]).mean()
+        trans_w_loss = safe_masked_mean(trans_w_loss, mask[..., None])
         extra_loss += trans_w_loss * weights.transl_w
         extra_loss_dict["transl_w_loss"] = trans_w_loss
 
@@ -477,13 +484,13 @@ def compute_extra_global_loss(inputs, outputs, ppl):
         vel_thr = args.static_conf.vel_thr
         assert vel_thr > 0
         joint_ids = [7, 10, 8, 11, 20, 21]  # [L_Ankle, L_foot, R_Ankle, R_foot, L_wrist, R_wrist]
-        gt_w_j3d = endecoder.fk_v2(**inputs["smpl_params_w"])  # (B, L, J=22, 3)
+        gt_w_j3d = endecoder.fk_v2(**inputs["interactee_smpl_params_w"])  # (B, L, J=22, 3)
         static_gt = get_static_joint_mask(gt_w_j3d, vel_thr=vel_thr, repeat_last=True)  # (B, L, J)
         static_gt = static_gt[:, :, joint_ids].float()  # (B, L, J')
         pred_static_conf_logits = static_conf_logits
 
         static_conf_loss = F.binary_cross_entropy_with_logits(pred_static_conf_logits, static_gt, reduction="none")
-        static_conf_loss = (static_conf_loss * mask[..., None]).mean()
+        static_conf_loss = safe_masked_mean(static_conf_loss, mask[..., None])
         extra_loss += static_conf_loss * weights.static_conf_bce
         extra_loss_dict["static_conf_loss"] = static_conf_loss
 

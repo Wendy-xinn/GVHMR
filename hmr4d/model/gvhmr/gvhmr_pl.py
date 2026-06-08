@@ -45,6 +45,7 @@ class GvhmrPL(pl.LightningModule):
         freeze_ego_head=True,
         copy_exo_to_ego=True,
         vis_every_n_steps=100,
+        val_vis_every_n_batches=50,  # 验证集可视化间隔（每隔 N 个 batch 可视化一次）
     ):
         super().__init__()
         self.pipeline = instantiate(pipeline, _recursive_=False)
@@ -78,6 +79,7 @@ class GvhmrPL(pl.LightningModule):
         # 将转换矩阵注册为 buffer，但不移动到设备（在可视化时动态移动到对应设备）
 
         self.vis_every_n_steps = vis_every_n_steps
+        self.val_vis_every_n_batches = val_vis_every_n_batches
     
     def _copy_exo_to_ego(self):
         den = self.pipeline.denoiser3d
@@ -273,7 +275,7 @@ class GvhmrPL(pl.LightningModule):
             del wis3d
 
         # 2. 可视化模型输出: incam (局部) 和 global (整体)
-        self._visualize_model_output(batch, outputs)
+        self._visualize_model_output(batch, outputs, tag_prefix="train")
 
     def _visualize_model_output(self, batch, outputs, tag_prefix="train"):
         """可视化模型预测输出: incam overlay（interactee 的 2D 可视化）
@@ -290,8 +292,8 @@ class GvhmrPL(pl.LightningModule):
         if pred_smpl_params_incam is None:
             return
         
-        exo_incam_gt_key = "interactee_smpl_params_c" if "interactee_smpl_params_c" in batch else "smpl_params_c"
-        if exo_incam_gt_key not in batch:
+        exo_incam_gt_key = "interactee_smpl_params_c" 
+        if exo_incam_gt_key not in batch or batch.get(exo_incam_gt_key) is None:
             return
         
         with torch.no_grad():
@@ -310,21 +312,28 @@ class GvhmrPL(pl.LightningModule):
             _, gt_j3d = self.smplx(**batch[exo_incam_gt_key])
             gt_j3d = gt_j3d.reshape(B, F, -1, 3)
             
+            # # Debug: 检查 GT 数据
+            # Log.info(f"[Vis] GT verts range: [{gt_verts.min():.3f}, {gt_verts.max():.3f}]")
+            # Log.info(f"[Vis] GT j3d range: [{gt_j3d.min():.3f}, {gt_j3d.max():.3f}]")
+            # Log.info(f"[Vis] GT transl[0,0]: {batch[exo_incam_gt_key]['transl'][0, 0]}")
+            
             # 渲染 incam overlay
             self._render_incam_overlay(
                 batch, pred_verts, pred_j3d, gt_verts, gt_j3d, 
-                tag_prefix=tag_prefix
+                tag_prefix=tag_prefix,
+                vis_frames=2
             )
 
-    def _render_incam_overlay(self, batch, pred_verts, pred_joints, gt_verts, gt_j3d, tag_prefix="train"):
+    def _render_incam_overlay(self, batch, pred_verts, pred_joints, gt_verts, gt_j3d, tag_prefix="train", vis_frames=8):
         """
-            可视化:
+            可视化多帧:
                 1. pred 
                 2. gt 
                 3. pred/gt mesh compare
             
             Args:
                 tag_prefix: TensorBoard 日志路径前缀，训练阶段用 "train"，验证阶段用 "val"
+                vis_frames: 可视化的帧数
         """
         from hmr4d.utils.vis.renderer import Renderer
         
@@ -333,87 +342,165 @@ class GvhmrPL(pl.LightningModule):
             Log.warning("[Vis] imgname_list is empty")
             return
 
-        # 读取图像并获取相机内参
-        if isinstance(imgname_list[0], list):
-            img_path = self._resolve_image_path(imgname_list[0][0])
-        else:
-            img_path = self._resolve_image_path(imgname_list[0])
-        img = cv2.imread(img_path)
-        if img is None:
-            Log.warning(f"[Vis] Failed to read image: {img_path}")
-            return
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        H, W = img_rgb.shape[:2]
-        K = batch["K_fullimg"][0, 0] if batch["K_fullimg"].ndim == 4 else batch["K_fullimg"][0]
-
-        # 取预测的顶点和关节点 (batch 0, frame 0)
-        # 转换为 float32，因为渲染器期望 float32 类型
-        pred_verts_0 = pred_verts[0, 0].detach().cpu().float()
-        pred_joints_0 = pred_joints[0, 0].detach().cpu().float()
-
-        # 创建渲染器
-        renderer = Renderer(W, H, device="cpu", faces=self.smplx_full.faces, K=K)
-        bbx = batch["bbx_xys"][0]
-        if bbx.ndim > 1:
-            bbx = bbx[0]
-        bbx = bbx.cpu().numpy()
-
-        # 渲染预测 Mesh (蓝色)
-        pred_img = renderer.render_mesh(pred_verts_0, background=img_rgb.copy(), colors=[0.3, 0.5, 1.0])
-        # 绘制预测关键点 (使用 draw_coco17_skeleton_batch)
-        # 使用原模型的 perspective_projection 函数
-        # 确保 K 在 CPU 上，并将 joints 转为 (1, 1, J, 3) 形状
-        K_cpu = K.cpu() if isinstance(K, torch.Tensor) else K
-        pred_joints_tensor = pred_joints_0 if isinstance(pred_joints_0, torch.Tensor) else torch.from_numpy(pred_joints_0)
-        pred_j2d = perspective_projection(pred_joints_tensor.unsqueeze(0).unsqueeze(0), K_cpu.unsqueeze(0).unsqueeze(0))
-        pred_j2d = pred_j2d.squeeze(0).squeeze(0).numpy()
-        kp2d_pred = np.concatenate([pred_j2d, np.ones((pred_j2d.shape[0], 1))], axis=-1)
-        pred_overlay = draw_coco17_skeleton_batch([pred_img], [kp2d_pred])[0]
-        pred_overlay = draw_bbx_xys_on_image_batch([bbx], [pred_overlay])[0]
-
-        # 渲染 GT (红色，如果存在)
-        if gt_verts is not None:
-            gt_verts_0 = gt_verts[0, 0].detach().cpu().float()
-            gt_joints_0 = gt_j3d[0, 0].detach().cpu().float()
-            gt_img = renderer.render_mesh(gt_verts_0, background=img_rgb.copy(), colors=[1.0, 0.3, 0.3])
-            gt_joints_tensor = gt_joints_0 if isinstance(gt_joints_0, torch.Tensor) else torch.from_numpy(gt_joints_0)
-            gt_j2d = perspective_projection(gt_joints_tensor.unsqueeze(0).unsqueeze(0), K_cpu.unsqueeze(0).unsqueeze(0))
-            gt_j2d = gt_j2d.squeeze(0).squeeze(0).numpy()
-            kp2d_gt = np.concatenate([gt_j2d, np.ones((gt_j2d.shape[0], 1))], axis=-1)
-            gt_overlay = draw_coco17_skeleton_batch([gt_img], [kp2d_gt])[0]
-            gt_overlay = draw_bbx_xys_on_image_batch([bbx], [gt_overlay])[0]
+        B, F = pred_verts.shape[:2]
+        
+        # 获取相机内参和 bbox (所有帧)
+        K_fullimg = batch["K_fullimg"]  # (B, F, 3, 3) 或 (B, F, 3, 3)
+        bbx_xys = batch["bbx_xys"]  # (B, F, 4) 或 (B, F, 4)
+        
+        # 选择要可视化的帧索引
+        frame_indices = np.linspace(0, F - 1, vis_frames, dtype=int)
+        
+        # 收集所有帧的图像
+        pred_overlays = []
+        gt_overlays = []
+        pred_gt_overlays = []
+        
+        for idx_in_vis, frame_idx in enumerate(frame_indices):
+            # 读取当前帧的图像
+            if isinstance(imgname_list, list) and len(imgname_list) > 0:
+                if isinstance(imgname_list[0], list):
+                    # imgname_list 是嵌套列表 [batch][frame]
+                    if len(imgname_list[0]) > frame_idx:
+                        img_path = self._resolve_image_path(imgname_list[0][frame_idx])
+                    else:
+                        img_path = self._resolve_image_path(imgname_list[0][0])
+                else:
+                    # imgname_list 是扁平列表，需要计算索引
+                    if len(imgname_list) > frame_idx:
+                        img_path = self._resolve_image_path(imgname_list[frame_idx])
+                    else:
+                        img_path = self._resolve_image_path(imgname_list[0])
+            else:
+                Log.warning(f"[Vis] Cannot get image for frame {frame_idx}")
+                continue
+                
+            img = cv2.imread(img_path)
+            if img is None:
+                Log.warning(f"[Vis] Failed to read image: {img_path}")
+                continue
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            H, W = img_rgb.shape[:2]
             
-            pred_gt = None
-            bg = np.ones((H, W, 3), dtype=np.uint8) * 255
-            # pred mesh
-            pred_mesh_img = renderer.render_mesh(
-                pred_verts_0,
-                background=bg.copy(),
-                colors=[0.2, 0.4, 1.0],
-            )
-            # gt mesh
-            gt_mesh_img = renderer.render_mesh(
-                gt_verts_0,
-                background=pred_mesh_img,
-                colors=[1.0, 0.2, 0.2],
-            )
-            pred_gt = gt_mesh_img
-            # pred_gt = cv2.addWeighted(
-            #     pred_mesh_img,
-            #     0.5,
-            #     gt_mesh_img,
-            #     0.5,
-            #     0,
-            # )
+            # 获取当前帧的相机内参
+            if K_fullimg.ndim == 4:
+                K = K_fullimg[0, frame_idx]  # (B, F, 3, 3) -> (3, 3)
+            elif K_fullimg.ndim == 3:
+                K = K_fullimg[frame_idx]  # (F, 3, 3) -> (3, 3)
+            else:
+                K = K_fullimg[0]  # fallback
+            
+            # 获取当前帧的 bbox
+            if bbx_xys.ndim == 3:
+                bbx = bbx_xys[0, frame_idx]  # (B, F, 4) -> (4,)
+            elif bbx_xys.ndim == 2:
+                bbx = bbx_xys[frame_idx]  # (F, 4) -> (4,)
+            else:
+                bbx = bbx_xys[0]  # fallback
+            bbx = bbx.cpu().numpy()
+            
+            # 创建渲染器
+            renderer = Renderer(W, H, device="cpu", faces=self.smplx_full.faces, K=K)
+            K_cpu = K.cpu() if isinstance(K, torch.Tensor) else K
+            
+            # 取当前帧的顶点和关节点 (batch 0)
+            pred_verts_f = pred_verts[0, frame_idx].detach().cpu().float()
+            pred_joints_f = pred_joints[0, frame_idx].detach().cpu().float()
+
+            # 渲染预测 Mesh (蓝色)
+            pred_img = renderer.render_mesh(pred_verts_f, background=img_rgb.copy(), colors=[0.3, 0.5, 1.0])
+            # 绘制预测关键点
+            pred_joints_tensor = pred_joints_f if isinstance(pred_joints_f, torch.Tensor) else torch.from_numpy(pred_joints_f)
+            pred_j2d = perspective_projection(pred_joints_tensor.unsqueeze(0).unsqueeze(0), K_cpu.unsqueeze(0).unsqueeze(0))
+            pred_j2d = pred_j2d.squeeze(0).squeeze(0).numpy()
+            kp2d_pred = np.concatenate([pred_j2d, np.ones((pred_j2d.shape[0], 1))], axis=-1)
+            pred_overlay = draw_coco17_skeleton_batch([pred_img], [kp2d_pred])[0]
+            pred_overlay = draw_bbx_xys_on_image_batch([bbx], [pred_overlay])[0]
+            pred_overlays.append(pred_overlay)
+            
+            # 渲染 GT (红色，如果存在)
+            if gt_verts is not None:
+                gt_verts_f = gt_verts[0, frame_idx].detach().cpu().float()
+                gt_joints_f = gt_j3d[0, frame_idx].detach().cpu().float()
+                gt_img = renderer.render_mesh(gt_verts_f, background=img_rgb.copy(), colors=[1.0, 0.3, 0.3])
+                gt_joints_tensor = gt_joints_f if isinstance(gt_joints_f, torch.Tensor) else torch.from_numpy(gt_joints_f)
+                gt_j2d = perspective_projection(gt_joints_tensor.unsqueeze(0).unsqueeze(0), K_cpu.unsqueeze(0).unsqueeze(0))
+                gt_j2d = gt_j2d.squeeze(0).squeeze(0).numpy()
+                
+                if idx_in_vis == 0:
+                    Log.info(f"[Vis] gt_j2d range: [{gt_j2d[:, 0].min():.1f}, {gt_j2d[:, 0].max():.1f}] x [{gt_j2d[:, 1].min():.1f}, {gt_j2d[:, 1].max():.1f}]")
+                    Log.info(f"[Vis] gt_joints z range: [{gt_joints_tensor[:, 2].min():.3f}, {gt_joints_tensor[:, 2].max():.3f}]")
+                
+                kp2d_gt = np.concatenate([gt_j2d, np.ones((gt_j2d.shape[0], 1))], axis=-1)
+                gt_overlay = draw_coco17_skeleton_batch([gt_img], [kp2d_gt])[0]
+                gt_overlay = draw_bbx_xys_on_image_batch([bbx], [gt_overlay])[0]
+                gt_overlays.append(gt_overlay)
+                
+                # pred/gt mesh compare
+                bg = np.ones((H, W, 3), dtype=np.uint8) * 255
+                pred_mesh_img = renderer.render_mesh(pred_verts_f, background=bg.copy(), colors=[0.2, 0.4, 1.0])
+                gt_mesh_img = renderer.render_mesh(gt_verts_f, background=pred_mesh_img, colors=[1.0, 0.2, 0.2])
+                pred_gt_overlays.append(gt_mesh_img)
+            
+            del renderer
+        
+        # 将多帧图像拼接成网格 (2行 x N列 或 N行 x 2列)
+        def stack_images_horizontal(image_list):
+            """水平拼接图像列表"""
+            if len(image_list) == 0:
+                return np.zeros((H, W, 3), dtype=np.uint8)
+            return np.concatenate(image_list, axis=1)
+        
+        def stack_images_vertical(image_list):
+            """垂直拼接图像列表"""
+            if len(image_list) == 0:
+                return np.zeros((H, W, 3), dtype=np.uint8)
+            return np.concatenate(image_list, axis=0)
+        
+        # 对于多帧，我们创建一个网格布局
+        # 如果帧数 <= 4，使用 2x2 或 1xN 布局
+        # 如果帧数 > 4，使用多行布局
+        
+        n_frames = len(pred_overlays)
+        if n_frames <= 4:
+            # 水平拼接所有帧
+            pred_combined = stack_images_horizontal(pred_overlays)
+            if gt_overlays:
+                gt_combined = stack_images_horizontal(gt_overlays)
+            if pred_gt_overlays:
+                pred_gt_combined = stack_images_horizontal(pred_gt_overlays)
+        else:
+            # 分成多行，每行 4 帧
+            cols = 4
+            rows = (n_frames + cols - 1) // cols
+            
+            pred_rows = []
+            gt_rows = []
+            pred_gt_rows = []
+            
+            for r in range(rows):
+                start_idx = r * cols
+                end_idx = min(start_idx + cols, n_frames)
+                pred_rows.append(stack_images_horizontal(pred_overlays[start_idx:end_idx]))
+                if gt_overlays:
+                    gt_rows.append(stack_images_horizontal(gt_overlays[start_idx:end_idx]))
+                if pred_gt_overlays:
+                    pred_gt_rows.append(stack_images_horizontal(pred_gt_overlays[start_idx:end_idx]))
+            
+            pred_combined = stack_images_vertical(pred_rows)
+            if gt_rows:
+                gt_combined = stack_images_vertical(gt_rows)
+            if pred_gt_rows:
+                pred_gt_combined = stack_images_vertical(pred_gt_rows)
     
-        pred_tb = torch.from_numpy(pred_overlay).permute(2, 0, 1)
-        self.logger.experiment.add_image(f"{tag_prefix}/incam_pred", pred_tb, self.global_step)
-        if gt_overlay is not None:
-            gt_tb = torch.from_numpy(gt_overlay).permute(2, 0, 1)
-            self.logger.experiment.add_image(f"{tag_prefix}/incam_gt", gt_tb, self.global_step)
-        if pred_gt is not None:
-            pred_gt_tb = torch.from_numpy(pred_gt).permute(2, 0, 1)
-            self.logger.experiment.add_image(f"{tag_prefix}/incam_pred_gt_overlay", pred_gt_tb, self.global_step)
+        pred_tb = torch.from_numpy(pred_combined).permute(2, 0, 1)
+        self.logger.experiment.add_image(f"{tag_prefix}/incam_pred_multi", pred_tb, self.global_step)
+        if gt_overlays:
+            gt_tb = torch.from_numpy(gt_combined).permute(2, 0, 1)
+            self.logger.experiment.add_image(f"{tag_prefix}/incam_gt_multi", gt_tb, self.global_step)
+        if pred_gt_overlays:
+            pred_gt_tb = torch.from_numpy(pred_gt_combined).permute(2, 0, 1)
+            self.logger.experiment.add_image(f"{tag_prefix}/incam_pred_gt_overlay_multi", pred_gt_tb, self.global_step)
 
     def _visualize_validation(self, batch, outputs):
         """可视化 validation/test 阶段: ego/exo global 视频 + exo incam overlay"""
@@ -433,77 +520,113 @@ class GvhmrPL(pl.LightningModule):
                 for out in [smplx_out_pred, smplx_out_gt]:
                     out.vertices = out.vertices.reshape(B, F, -1, 3)
                     out.joints = out.joints.reshape(B, F, -1, 3)
-                render_global_video(smplx_out_pred, smplx_out_gt, global_step, output_dir, tag_prefix="ego", vis_frames=30)
+                render_global_video(smplx_out_pred, smplx_out_gt, global_step, output_dir, tag_prefix="ego", vis_frames=60)
+                # Wis3d 可视化 (ego)
+                self._visualize_val_global(batch, smplx_out_pred, smplx_out_gt, self.smplx_full, tag_prefix="ego")
         
         # 2. Exo global 视频
         pred_smpl_params_global = outputs.get("pred_smpl_params_global", None)
-        if pred_smpl_params_global is not None and "interactee_smpl_params_w" in batch:
+        interactee_smpl_params_w = batch.get("interactee_smpl_params_w", None)
+        if pred_smpl_params_global is not None and interactee_smpl_params_w is not None:
             with torch.no_grad():
                 pred_reshaped = {k: v.reshape(B * F, -1) for k, v in pred_smpl_params_global.items()}
-                gt_reshaped = {k: v.reshape(B * F, -1) for k, v in batch["interactee_smpl_params_w"].items()}
+                gt_reshaped = {k: v.reshape(B * F, -1) for k, v in interactee_smpl_params_w.items()}
                 smplx_out_pred = self.smplx_full(**pred_reshaped)
                 smplx_out_gt = self.smplx_full(**gt_reshaped)
                 for out in [smplx_out_pred, smplx_out_gt]:
                     out.vertices = out.vertices.reshape(B, F, -1, 3)
                     out.joints = out.joints.reshape(B, F, -1, 3)
-                render_global_video(smplx_out_pred, smplx_out_gt, global_step, output_dir, tag_prefix="exo", vis_frames=30)
+                render_global_video(smplx_out_pred, smplx_out_gt, global_step, output_dir, tag_prefix="exo", vis_frames=60)
+                # Wis3d 可视化 (exo)
+                self._visualize_val_global(batch, smplx_out_pred, smplx_out_gt, self.smplx_full, tag_prefix="exo")
         
         # 3. Exo incam overlay
         self._visualize_model_output(batch, outputs, tag_prefix="val")
 
     # 利用wis3d进行可视化，可以用来debug  
-    def _visualize_val_global(self, batch, smplx_out_pred, smplx_out_gt, smplx_model):
-        """可视化 validation/test 阶段的 global 预测结果"""
-        wis3d = make_wis3d(name="val_global_motion", time_postfix=True)
+    def _visualize_val_global(self, batch, smplx_out_pred, smplx_out_gt, smplx_model, tag_prefix="exo"):
+        """可视化 validation/test 阶段的 global 预测结果
         
-        # gender = batch["gender"][0]
-        # T_w2ay = batch["T_w2ay"][0]
+        使用脚底对齐地面的可视化方式，保存 ego/exo 的 gt 和 pred
+        """
+        wis3d = make_wis3d(name=f"val_global_motion_{tag_prefix}", time_postfix=True)
+        
         device = smplx_out_gt.vertices.device
-        B = batch["smpl_params_c"]["body_pose"].shape[0]
+        B, F = smplx_out_gt.vertices.shape[:2]
         
-        # EgoBody 世界坐标系：Y 轴向上（gravity_vec = [0, -1, 0]）
-        # GVHMR ay 坐标系：Y 轴向上
-        # 两者坐标系一致，T_w2ay 为单位矩阵
-        T_w2ay = torch.eye(4, device=device).unsqueeze(0).repeat(B, 1, 1)
+        # 获取顶点和关节点 (第一个 batch)
+        pred_verts = smplx_out_pred.vertices[0].float()  # (F, V_smplx, 3)
+        gt_verts = smplx_out_gt.vertices[0].float()  # (F, V_smplx, 3)
+        # pred_joints = smplx_out_pred.joints[0].float()  # (F, J, 3)
+        # gt_joints = smplx_out_gt.joints[0].float()  # (F, J, 3)
+        
+        # 转换为 SMPL 顶点（J_regressor 是针对 SMPL 的）
+        smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").to(device).to_dense().float()
+        J_regressor = torch.load("hmr4d/utils/body_model/smpl_neutral_J_regressor.pt").to(device).float()
+        pred_verts_smpl = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in pred_verts])  # (F, V_smpl, 3)
+        gt_verts_smpl = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in gt_verts])  # (F, V_smpl, 3)
+        
+        # 脚底对齐地面的对齐函数（和 demo.py 一致）
+        def move_to_start_point_face_z(verts):
+            """XZ 到原点，脚底对齐地面，面朝 Z 方向"""
+            verts = verts.clone()
+            offset = einsum(J_regressor, verts[0], "j v, v i -> j i")[0]  # (3)
+            offset[1] = verts[:, :, [1]].min()
+            verts = verts - offset
+            
+            # 面朝方向
+            T_ay2ayfz = compute_T_ayfz2ay(einsum(J_regressor, verts[[0]], "j v, l v i -> l j i"), inverse=True)
+            verts = apply_T_on_points(verts, T_ay2ayfz)
+            
+            return verts
+        
+        # 对齐 pred 和 gt（各自对齐到各自的 ayfz 坐标系）
+        pred_verts_aligned = move_to_start_point_face_z(pred_verts_smpl)
+        gt_verts_aligned = move_to_start_point_face_z(gt_verts_smpl)
+        gt_joints_aligned = einsum(J_regressor, gt_verts_aligned, "j v, l v i -> l j i")  # (F, J, 3)
         
         # 仅可视化第一个batch
-        vis_frames = min(smplx_out_pred.vertices.shape[1], 30)
-        # for i in range(len(smplx_out_pred.vertices)):
-        # for i in range(vis_frames):
-        #     wis3d.set_scene_id(i)
-        #     wis3d.add_mesh(smplx_out_pred.vertices[0, i], smplx_model.bm.faces, name=f"pred-smplx-global_{i}")
-    
-        # # GT (w)
-        # smplx_models = {
-        #     "male": make_smplx("rich-smplx", gender="male").cuda(),
-        #     "female": make_smplx("rich-smplx", gender="female").cuda(),
-        # }
-        # gt_smpl_params = {k: v[0, windows[0]] for k, v in batch["gt_smpl_params"].items()}
-        # gt_smplx_out = smplx_models[gender](**gt_smpl_params)
-
-        # GT (ayfz)：ay是将数据集的重力都统一为y=重力；ayfz是将数据集的重力统一为y=重力，并且人体面朝z方向，这样可以更好地观察人体的运动细节，而不受全局旋转的干扰？
-        smplx_verts_ay = apply_T_on_points(smplx_out_gt.vertices, T_w2ay)
-        smplx_joints_ay = apply_T_on_points(smplx_out_gt.joints, T_w2ay)
-        # 取第一帧计算 ayfz 变换 (B, J, 3)
-        T_ay2ayfz = compute_T_ayfz2ay(smplx_joints_ay[:, 0], inverse=True)  # (B, 4, 4)
-        smplx_verts_ayfz = apply_T_on_points(smplx_verts_ay, T_ay2ayfz)  # (B, F, V, 3)
+        vis_frames = min(F, 30)
         
-        # Pred 也在 ay 坐标系，需要同样应用 T_ay2ayfz 转换到 ayfz
-        T_ay2ayfz_pred = compute_T_ayfz2ay(smplx_out_pred.joints[:, 0], inverse=True)  # (B, 4, 4)
-        smplx_pred_verts_ayfz = apply_T_on_points(smplx_out_pred.vertices, T_ay2ayfz_pred)  # (B, F, V, 3)
-
+        # 获取地面参数（使用 gt 的根关节点）
+        gt_root_points = gt_joints_aligned[:, 0].cpu()  # (F, 3)
+        from hmr4d.utils.vis.renderer import get_ground_params_from_points
+        scale, cx, cz = get_ground_params_from_points(gt_root_points, gt_verts_aligned.cpu())
+        
+        # 生成 checkerboard 地面几何体
+        ground_v, ground_f, ground_vc, _ = checkerboard_geometry(
+            length=scale * 3,  # 地面大小
+            c1=cx,
+            c2=cz,
+            up="y",
+        )
+        
+        # 获取 SMPL faces
+        smpl_faces = make_smplx("smpl").faces
+        
         for i in range(vis_frames):
             wis3d.set_scene_id(i)
-            ground_v, ground_f, ground_vc, _ = checkerboard_geometry(
-                length=10,
-                c1=0,
-                c2=0,
-                up="y",
-            )
+            
+            # 添加地面
             wis3d.add_mesh(ground_v, ground_f, ground_vc, name="ground")
-            wis3d.add_mesh(smplx_pred_verts_ayfz[0, i], smplx_model.bm.faces, name=f"pred-smplx-ayfz_{i}")
-            wis3d.add_mesh(smplx_verts_ayfz[0, i], smplx_model.bm.faces, name=f"gt-smplx-ayfz_{i}")
+            
+            # 添加 pred mesh (蓝色)
+            wis3d.add_mesh(
+                pred_verts_aligned[i].cpu().numpy(), 
+                smpl_faces, 
+                name=f"pred-smplx-ayfz_{i}",
+                vertex_colors=np.tile([0.3, 0.5, 1.0, 1.0], (pred_verts_aligned.shape[1], 1)).astype(np.float32)
+            )
+            
+            # 添加 gt mesh (红色)
+            wis3d.add_mesh(
+                gt_verts_aligned[i].cpu().numpy(), 
+                smpl_faces, 
+                name=f"gt-smplx-ayfz_{i}",
+                vertex_colors=np.tile([1.0, 0.3, 0.3, 1.0], (gt_verts_aligned.shape[1], 1)).astype(np.float32)
+            )
         
+        Log.info(f"[Vis Val Global] Saved {tag_prefix} global visualization with {vis_frames} frames")
         del wis3d
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
@@ -584,8 +707,9 @@ class GvhmrPL(pl.LightningModule):
 
         # ========================================================
         # Validation/Test 可视化 (TensorBoard)
+        # 使用 val_vis_every_n_batches 控制频率，每个 epoch 可视化不同样本
         # ========================================================
-        if self.logger is not None and batch_idx == 0:
+        if self.logger is not None and batch_idx % self.val_vis_every_n_batches == 0:
             self._visualize_validation(batch, outputs)
             
 
