@@ -45,7 +45,10 @@ class GvhmrPL(pl.LightningModule):
         freeze_ego_head=True,
         copy_exo_to_ego=True,
         vis_every_n_steps=100,
-        val_vis_every_n_batches=50,  # 验证集可视化间隔（每隔 N 个 batch 可视化一次）
+        val_vis_every_n_steps=200,  # 验证集可视化间隔（每隔 N 个 step 可视化一次）
+        test_vis_every_n_batches=1,  # 测试阶段每隔 N 个 batch 可视化一次
+        test_vis_max_batches=2,  # 测试阶段最多可视化多少个 batch；0 表示关闭
+        zero_f_imgseq=False,  # 实验：将 f_imgseq 置零
     ):
         super().__init__()
         self.pipeline = instantiate(pipeline, _recursive_=False)
@@ -62,9 +65,9 @@ class GvhmrPL(pl.LightningModule):
 
         # Options
         self.ignored_weights_prefix = ignored_weights_prefix
+        self.zero_f_imgseq = zero_f_imgseq
 
-        # The test step is the same as validation
-        self.test_step = self.predict_step = self.validation_step
+        # Test/predict reuse validation logic; explicit hooks are defined below.
 
         # SMPLX (lite 版本用于训练)
         self.smplx = make_smplx("supermotion_v437coco17")
@@ -79,7 +82,9 @@ class GvhmrPL(pl.LightningModule):
         # 将转换矩阵注册为 buffer，但不移动到设备（在可视化时动态移动到对应设备）
 
         self.vis_every_n_steps = vis_every_n_steps
-        self.val_vis_every_n_batches = val_vis_every_n_batches
+        self.val_vis_every_n_steps = val_vis_every_n_steps
+        self.test_vis_every_n_batches = test_vis_every_n_batches
+        self.test_vis_max_batches = test_vis_max_batches
     
     def _copy_exo_to_ego(self):
         den = self.pipeline.denoiser3d
@@ -209,6 +214,10 @@ class GvhmrPL(pl.LightningModule):
         # f_imgseq = batch["f_imgseq"] + torch.randn_like(batch["f_imgseq"]) * 0.1
         # f_imgseq[~batch["mask"]["f_imgseq"]] = 0
         # batch["f_imgseq"] = f_imgseq.clone()
+
+        # 实验：将 f_imgseq 置零，验证 ego 头是否可以仅从 obs/cliffcam/cam_angvel 学习
+        if self.zero_f_imgseq:
+            batch["f_imgseq"] = torch.zeros_like(batch["f_imgseq"])
 
         # Forward and get loss
         outputs = self.pipeline.forward(batch, train=True)
@@ -427,9 +436,9 @@ class GvhmrPL(pl.LightningModule):
                 gt_j2d = perspective_projection(gt_joints_tensor.unsqueeze(0).unsqueeze(0), K_cpu.unsqueeze(0).unsqueeze(0))
                 gt_j2d = gt_j2d.squeeze(0).squeeze(0).numpy()
                 
-                if idx_in_vis == 0:
-                    Log.info(f"[Vis] gt_j2d range: [{gt_j2d[:, 0].min():.1f}, {gt_j2d[:, 0].max():.1f}] x [{gt_j2d[:, 1].min():.1f}, {gt_j2d[:, 1].max():.1f}]")
-                    Log.info(f"[Vis] gt_joints z range: [{gt_joints_tensor[:, 2].min():.3f}, {gt_joints_tensor[:, 2].max():.3f}]")
+                # if idx_in_vis == 0:
+                #     Log.info(f"[Vis] gt_j2d range: [{gt_j2d[:, 0].min():.1f}, {gt_j2d[:, 0].max():.1f}] x [{gt_j2d[:, 1].min():.1f}, {gt_j2d[:, 1].max():.1f}]")
+                #     Log.info(f"[Vis] gt_joints z range: [{gt_joints_tensor[:, 2].min():.3f}, {gt_joints_tensor[:, 2].max():.3f}]")
                 
                 kp2d_gt = np.concatenate([gt_j2d, np.ones((gt_j2d.shape[0], 1))], axis=-1)
                 gt_overlay = draw_coco17_skeleton_batch([gt_img], [kp2d_gt])[0]
@@ -521,8 +530,8 @@ class GvhmrPL(pl.LightningModule):
                     out.vertices = out.vertices.reshape(B, F, -1, 3)
                     out.joints = out.joints.reshape(B, F, -1, 3)
                 render_global_video(smplx_out_pred, smplx_out_gt, global_step, output_dir, tag_prefix="ego", vis_frames=60)
-                # Wis3d 可视化 (ego)
-                self._visualize_val_global(batch, smplx_out_pred, smplx_out_gt, self.smplx_full, tag_prefix="ego")
+                # # Wis3d 可视化 (ego)
+                # self._visualize_val_global(batch, smplx_out_pred, smplx_out_gt, self.smplx_full, tag_prefix="ego")
         
         # 2. Exo global 视频
         pred_smpl_params_global = outputs.get("pred_smpl_params_global", None)
@@ -537,8 +546,8 @@ class GvhmrPL(pl.LightningModule):
                     out.vertices = out.vertices.reshape(B, F, -1, 3)
                     out.joints = out.joints.reshape(B, F, -1, 3)
                 render_global_video(smplx_out_pred, smplx_out_gt, global_step, output_dir, tag_prefix="exo", vis_frames=60)
-                # Wis3d 可视化 (exo)
-                self._visualize_val_global(batch, smplx_out_pred, smplx_out_gt, self.smplx_full, tag_prefix="exo")
+                # # Wis3d 可视化 (exo)
+                # self._visualize_val_global(batch, smplx_out_pred, smplx_out_gt, self.smplx_full, tag_prefix="exo")
         
         # 3. Exo incam overlay
         self._visualize_model_output(batch, outputs, tag_prefix="val")
@@ -629,6 +638,12 @@ class GvhmrPL(pl.LightningModule):
         Log.info(f"[Vis Val Global] Saved {tag_prefix} global visualization with {vis_frames} frames")
         del wis3d
 
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
+        return self.validation_step(batch, batch_idx, dataloader_idx)
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        return self.validation_step(batch, batch_idx, dataloader_idx)
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         # Options & Check
         do_postproc = self.trainer.state.stage == "test"  # Only apply postproc in test
@@ -641,17 +656,41 @@ class GvhmrPL(pl.LightningModule):
         if "mask" in batch:
             obs[0, ~batch["mask"]["valid"][0]] = 0
 
-        batch_ = {
-            "length": batch["length"],
-            "obs": obs,
-            "bbx_xys": batch["bbx_xys"],
-            "K_fullimg": batch["K_fullimg"],
-            "cam_angvel": batch["cam_angvel"],
-            "f_imgseq": batch["f_imgseq"],
-        }
-        outputs = self.pipeline.forward(batch_, train=False, postproc=do_postproc_not_flip_test)
+        # batch_ = {
+        #     "length": batch["length"],
+        #     "obs": obs,
+        #     "bbx_xys": batch["bbx_xys"],
+        #     "K_fullimg": batch["K_fullimg"],
+        #     "cam_angvel": batch["cam_angvel"],
+        #     "f_imgseq": batch["f_imgseq"],
+        # }
+        # outputs = self.pipeline.forward(batch_, train=False, postproc=do_postproc_not_flip_test)
+        batch["obs"] = obs
+        with torch.no_grad():
+            gt_verts437, gt_j3d = self.smplx(**batch["interactee_smpl_params_c"])
+            root_ = gt_j3d[:, :, [11, 12], :].mean(-2, keepdim=True)
+            batch["gt_j3d"] = gt_j3d
+            batch["gt_cr_coco17"] = gt_j3d - root_
+            batch["gt_c_verts437"] = gt_verts437
+            batch["gt_cr_verts437"] = gt_verts437 - root_
+        outputs = self.pipeline.forward(batch, train=False, postproc=do_postproc_not_flip_test)
         outputs["pred_smpl_params_global"] = {k: v[0] for k, v in outputs["pred_smpl_params_global"].items()}
         outputs["pred_smpl_params_incam"] = {k: v[0] for k, v in outputs["pred_smpl_params_incam"].items()}
+        
+        # 计算并记录 val/test loss
+        B, F = batch["smpl_params_c"]["body_pose"].shape[:2]
+        log_prefix = "test" if self.trainer.state.stage == "test" else "val"
+        log_kwargs = {
+            "on_epoch": True,
+            "prog_bar": True,
+            "logger": True,
+            "batch_size": B,
+            "sync_dist": True,
+        }
+        self.log(f"{log_prefix}/loss", outputs["loss"], **log_kwargs)
+        for k, v in outputs.items():
+            if "_loss" in k:
+                self.log(f"{log_prefix}/{k}", v, **log_kwargs)
         
         # 处理 ego 输出（如果存在）
         if "pred_smpl_params_global_ego" in outputs:
@@ -707,11 +746,22 @@ class GvhmrPL(pl.LightningModule):
 
         # ========================================================
         # Validation/Test 可视化 (TensorBoard)
-        # 使用 val_vis_every_n_batches 控制频率，每个 epoch 可视化不同样本
         # ========================================================
-        if self.logger is not None and batch_idx % self.val_vis_every_n_batches == 0:
-            self._visualize_validation(batch, outputs)
-            
+        if self.logger is not None:
+            if self.trainer.state.stage == "test":
+                do_test_vis = (
+                    self.test_vis_max_batches > 0
+                    and batch_idx < self.test_vis_max_batches
+                    and batch_idx % self.test_vis_every_n_batches == 0
+                )
+                if do_test_vis:
+                    self._visualize_validation(batch, outputs)
+            else:
+                current_step = self.trainer.global_step
+                do_val_vis = self.val_vis_every_n_steps > 0 and current_step % self.val_vis_every_n_steps == 0 and batch_idx < 2
+                if do_val_vis:
+                    self._visualize_validation(batch, outputs)
+        
 
         if False:  # wis3d
             wis3d = make_wis3d(name="debug-rich-cap")

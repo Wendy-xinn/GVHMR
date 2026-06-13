@@ -12,6 +12,7 @@ from hmr4d.utils.pylogger import Log
 from hmr4d.dataset.imgfeat_motion.base_dataset import ImgfeatMotionDatasetBase
 from hmr4d.utils.net_utils import get_valid_mask, repeat_to_max_len, repeat_to_max_len_dict
 from hmr4d.utils.geo.hmr_global import get_R_c2gv
+from hmr4d.utils.geo_transform import compute_cam_angvel
 from hmr4d.utils.preproc import VitPoseExtractor
 from hmr4d.utils.preproc.vitfeat_extractor import get_batch
 from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_axis_angle
@@ -178,6 +179,7 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         lazy_load=True,
         use_kp2d="vitpose",
         overfit_single_sample=False,  # 过拟合训练：只使用第一个样本
+        overfit_n_samples=0,  # 过拟合训练：使用前 n 个样本
     ):
         self.root = Path(root)
         self.output_root = Path(output_root)
@@ -187,7 +189,8 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         self.lazy_load = lazy_load
         self.use_kp2d = use_kp2d
         self.overfit_single_sample = overfit_single_sample
-
+        self.overfit_n_samples = overfit_n_samples
+        
         self._preproc_paths = {}
         self._seq_lens = {}
         self._pkl_index = {}
@@ -223,8 +226,14 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
             num_samples = max(L // self.motion_frames, 1)
             if self.overfit_single_sample:
                 # 过拟合训练：只使用第一个 recording 的第一个样本
-                self.idx2meta.extend([r] * 1)
+                self.idx2meta.append(r)
                 return
+            if self.overfit_n_samples > 0:
+                # 多样本过拟合：使用前 N 个 recording，每个 recording 一个样本
+                self.idx2meta.append(r)
+                if len(self.idx2meta) >= self.overfit_n_samples:
+                    return
+                continue
             self.idx2meta.extend([r] * num_samples)
 
     def _build_pkl_index(self, recording_name: str, role: str):
@@ -302,7 +311,7 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         if target_length > length:
             start, end = 0, length
         else:
-            if self.overfit_single_sample:
+            if self.overfit_single_sample or self.overfit_n_samples > 0:
                 # 过拟合训练：固定使用第一个 120 帧片段
                 start = 0
             else:
@@ -442,13 +451,41 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         # ============================================================
         # 计算 R_c2gv (相机 → gravity-view 坐标系)
         # ============================================================
-        # 使用 PV 相机的外参 (T_w2c 的旋转部分)
+        # 注意：使用第一帧的 R_w2c 计算 R_c2gv，保证整个序列的 GV 参考系一致
+        # 重要：必须使用翻转后的 R_w2c（OpenCV 相机坐标系），因为 get_R_c2gv 假设相机 Z 轴向前
+        # Holo World 坐标系中 Y 轴向上，重力方向为 [0, -1, 0]
         if T_w2c is not None:
-            R_w2pv = T_w2c[0, :3, :3]  # (3,3) 
-        R_c2gv = get_R_c2gv(R_w2pv).unsqueeze(0).repeat(end - start, 1, 1)
+            # 先做 YZ 翻转，得到 OpenCV 相机坐标系的 R_w2c
+            T_flip_yz = torch.tensor([
+                [1,  0,  0],
+                [0, -1,  0],
+                [0,  0, -1]
+            ], dtype=torch.float32)
+            
+            R_w2c_holo = T_w2c[0, :3, :3]  # (3, 3) 第一帧的 world → PV (HoloLens)
+            R_w2c_opencv = T_flip_yz @ R_w2c_holo  # (3, 3) 第一帧的 world → PV (OpenCV)
+            
+            # 使用第一帧的 R_w2c 计算 R_c2gv，然后 repeat 到所有帧
+            R_c2gv = get_R_c2gv(R_w2c_opencv, axis_gravity_in_w=[0, -1, 0]).unsqueeze(0).repeat(end - start, 1, 1)
+        else:
+            # fallback: 使用单位矩阵
+            R_c2gv = torch.eye(3, dtype=torch.float32).unsqueeze(0).repeat(end - start, 1, 1)
 
         # 相机角速度 (PV 相机跟随 camera wearer 运动，从 preprocess 读取)
-        if "cam_angvel" in data:
+        # 注意：preprocess 中的 cam_angvel 是用 HoloLens 坐标系的 R_w2c 计算的
+        # 现在 R_w2c 已经翻转到 OpenCV 坐标系，需要重新计算 cam_angvel
+        if T_w2c is not None:
+            # 使用翻转后的 R_w2c 重新计算 cam_angvel
+            T_flip_yz = torch.tensor([
+                [1,  0,  0],
+                [0, -1,  0],
+                [0,  0, -1]
+            ], dtype=torch.float32)
+            
+            R_w2c_holo = T_w2c[:, :3, :3]  # (F, 3, 3) world → PV (HoloLens)
+            R_w2c_opencv = T_flip_yz @ R_w2c_holo  # (F, 3, 3) world → PV (OpenCV)
+            cam_angvel = compute_cam_angvel(R_w2c_opencv)  # (F, 6)
+        elif "cam_angvel" in data:
             cam_angvel = data["cam_angvel"][start:end].float()
         else:
             cam_angvel = torch.zeros((end - start, 6), dtype=torch.float32)

@@ -36,6 +36,16 @@ class DataModule(pl.LightningDataModule):
                 Log.info(f"[Val Dataset][{idx+1}/{len(split_opts)}]: name={k}, size={len(dataset[-1])}, {v._target_}")
             self.valsets = dataset
 
+        # Test
+        if "test" in dataset_opts:
+            split_opts = dataset_opts.get("test")
+            dataset = []
+            for idx, (k, v) in enumerate(split_opts.items()):
+                dataset_i = instantiate(v)
+                dataset.append(dataset_i)
+                Log.info(f"[Test Dataset][{idx+1}/{len(split_opts)}]: name={k}, size={len(dataset[-1])}, {v._target_}")
+            self.testsets = dataset
+
     def train_dataloader(self):
         return DataLoader(
             self.trainset,
@@ -57,6 +67,21 @@ class DataModule(pl.LightningDataModule):
                     num_workers=self.loader_opts.val.num_workers,
                     persistent_workers=True and self.loader_opts.val.num_workers > 0,
                     batch_size=self.loader_opts.val.batch_size,
+                    collate_fn=collate_fn,
+                )
+            )
+        return CombinedLoader(loaders, mode="sequential")
+
+    def test_dataloader(self):
+        loaders = []
+        for testset in self.testsets:
+            loaders.append(
+                DataLoader(
+                    testset,
+                    shuffle=False,
+                    num_workers=self.loader_opts.test.num_workers,
+                    persistent_workers=True and self.loader_opts.test.num_workers > 0,
+                    batch_size=self.loader_opts.test.batch_size,
                     collate_fn=collate_fn,
                 )
             )

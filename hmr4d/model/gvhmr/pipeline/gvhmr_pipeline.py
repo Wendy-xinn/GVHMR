@@ -149,7 +149,7 @@ class Pipeline(nn.Module):
                 outputs["pred_smpl_params_global"]["body_pose"] = body_pose
                 outputs["pred_smpl_params_incam"]["body_pose"] = body_pose
 
-            return outputs
+            # return outputs
 
         # ========== Compute Loss ========== #
         total_loss = 0
@@ -166,6 +166,13 @@ class Pipeline(nn.Module):
                 pred_x_ego = torch.nan_to_num(pred_x_ego, nan=0.0, posinf=1e3, neginf=-1e3)
             
             target_x = self.endecoder.encode(inputs)  # (B, L, C)
+            # interactee_inputs = {
+            #         "smpl_params_c": inputs["interactee_smpl_params_c"],
+            #         "smpl_params_w": inputs["interactee_smpl_params_w"],
+            #         "R_c2gv": inputs["R_c2gv"],
+            #         "mask": inputs["mask"],
+            #     }
+            # target_x = self.endecoder.encode(interactee_inputs)  # (B, L, C)
             simple_loss_ego = F.mse_loss(pred_x_ego, target_x, reduction="none")
             mask_simple_ego = mask[:, :, None].expand(-1, -1, pred_x_ego.size(2)).clone()
             mask_simple_ego[inputs["mask"]["spv_incam_only"], :, 142:] = False
@@ -179,8 +186,14 @@ class Pipeline(nn.Module):
             if torch.isnan(pred_x).any() or torch.isinf(pred_x).any():
                 Log.warning("NaN/Inf found in pred_x! Setting to zero.")
                 pred_x = torch.nan_to_num(pred_x, nan=0.0, posinf=1e3, neginf=-1e3)
-            
-            target_x = self.endecoder.encode(inputs)
+                
+            interactee_inputs = {
+                    "smpl_params_c": inputs["interactee_smpl_params_c"],
+                    "smpl_params_w": inputs["interactee_smpl_params_w"],
+                    "R_c2gv": inputs["R_c2gv"],
+                    "mask": inputs["mask"],
+                }
+            target_x = self.endecoder.encode(interactee_inputs)
             simple_loss = F.mse_loss(pred_x, target_x, reduction="none")
             mask_simple = mask[:, :, None].expand(-1, -1, pred_x.size(2)).clone()
             mask_simple[inputs["mask"]["spv_incam_only"], :, 142:] = False
@@ -199,6 +212,14 @@ class Pipeline(nn.Module):
             ego_global_loss, ego_global_loss_dict = compute_extra_global_loss_ego(inputs, outputs, self)
             total_loss += ego_global_loss
             outputs.update(ego_global_loss_dict)
+            # extra_funcs = [
+            #     compute_extra_incam_loss,
+            #     compute_extra_global_loss,
+            # ]
+            # for extra_func in extra_funcs:
+            #     ego_extra_loss, ego_extra_loss_dict = extra_func(inputs, outputs, self)
+            #     total_loss += ego_extra_loss
+            #     outputs.update(ego_extra_loss_dict)
         
         # Exo extra loss (如果存在且未冻结)
         if not has_ego or not self.args.get("freeze_exo_head", False):
@@ -246,6 +267,7 @@ def compute_extra_incam_loss_ego(inputs, outputs, ppl):
     
     # GT
     gt_c_j3d = endecoder.fk_v2(**inputs["smpl_params_c"])
+    # gt_c_j3d = endecoder.fk_v2(**inputs["interactee_smpl_params_c"])
     gt_cr_j3d = gt_c_j3d - gt_c_j3d[:, :, :1]
 
     # Root aligned C-MPJPE Loss
@@ -264,7 +286,10 @@ def compute_extra_incam_loss_ego(inputs, outputs, ppl):
         root_ = pred_c_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
         pred_cr_verts437 = pred_c_verts437 - root_
 
-        gt_cr_verts437 = inputs["gt_cr_verts437"]
+        # gt_cr_verts437 = inputs["gt_cr_verts437"]
+        gt_c_verts437, gt_c_j17= endecoder.smplx_model(**inputs["smpl_params_c"])
+        root_ = gt_c_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
+        gt_cr_verts437 = gt_c_verts437 - root_
         cr_vert_loss = F.mse_loss(pred_cr_verts437, gt_cr_verts437, reduction="none")
         cr_vert_loss = safe_masked_mean(cr_vert_loss, mask[:, :, None, None])
         extra_loss += cr_vert_loss * weights.cr_verts

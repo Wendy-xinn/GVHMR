@@ -1,0 +1,18 @@
+_target_: hmr4d.datamodule.egobody_view.DataModule
+dataset_opts:
+  test:
+    egobody_view1_ego_test:
+      _target_: hmr4d.dataset.egobody.egobody_view1.EgoBodyView1Dataset
+      root: /public/home/wenxin/egobody
+      output_root: /public/home/wenxin/egobody/output
+      split: test
+      role: ego
+      motion_frames: 120
+      use_kp2d: vitpose
+      overfit_single_sample: false
+      overfit_n_samples: 0
+
+loader_opts:
+  test:
+    batch_size: 1
+    num_workers: 2
