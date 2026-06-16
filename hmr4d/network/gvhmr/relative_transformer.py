@@ -21,6 +21,7 @@ class NetworkEncoderRoPE(nn.Module):
         cliffcam_dim=3,
         cam_angvel_dim=6,
         imgseq_dim=1024,
+        ego_sensor_dim=0,
         # intermediate
         latent_dim=512,
         num_layers=12,
@@ -45,6 +46,7 @@ class NetworkEncoderRoPE(nn.Module):
         self.cliffcam_dim = cliffcam_dim
         self.cam_angvel_dim = cam_angvel_dim
         self.imgseq_dim = imgseq_dim
+        self.ego_sensor_dim = ego_sensor_dim
 
         # intermediate
         self.latent_dim = latent_dim
@@ -118,8 +120,16 @@ class NetworkEncoderRoPE(nn.Module):
                 nn.LayerNorm(self.imgseq_dim),
                 zero_module(nn.Linear(self.imgseq_dim, latent_dim)),
             )
+        if self.ego_sensor_dim > 0:
+            self.ego_sensor_embedder = nn.Sequential(
+                nn.LayerNorm(self.ego_sensor_dim),
+                nn.Linear(self.ego_sensor_dim, latent_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                zero_module(nn.Linear(latent_dim, latent_dim)),
+            )
 
-    def forward(self, length, obs=None, f_cliffcam=None, f_cam_angvel=None, f_imgseq=None):
+    def forward(self, length, obs=None, f_cliffcam=None, f_cam_angvel=None, f_imgseq=None, f_ego_sensor=None):
         """
         Args:
             x: None we do not use it
@@ -129,6 +139,7 @@ class NetworkEncoderRoPE(nn.Module):
             f_cliffcam: (B, L, 3), CLIFF-Cam parameters (bbx-detection in the full-image)
             f_noisyobs: (B, L, C), noisy pose observation
             f_cam_angvel: (B, L, 6), Camera angular velocity
+            f_ego_sensor: (B, L, C), timestamp-aligned wearer-side head/gaze features
         """
         B, L, J, C = obs.shape
         assert J == 17 and C == 3
@@ -148,6 +159,8 @@ class NetworkEncoderRoPE(nn.Module):
             f_to_add.append(self.cam_angvel_embedder(f_cam_angvel))
         if f_imgseq is not None and hasattr(self, "imgseq_embedder"):
             f_to_add.append(self.imgseq_embedder(f_imgseq))
+        if f_ego_sensor is not None and hasattr(self, "ego_sensor_embedder"):
+            f_to_add.append(self.ego_sensor_embedder(f_ego_sensor))
 
         for f_delta in f_to_add:
             x = x + f_delta

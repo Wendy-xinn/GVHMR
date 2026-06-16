@@ -9,6 +9,7 @@ dataset_opts:
       role: ego
       motion_frames: 120
       use_kp2d: vitpose
+      use_ego_sensor: true
       overfit_single_sample: false
       overfit_n_samples: 50
 

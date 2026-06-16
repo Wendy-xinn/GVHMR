@@ -77,6 +77,15 @@ def _transform_c2w(smpl_params_c: Dict[str, torch.Tensor], T_c2w: torch.Tensor) 
     return smpl_params_w
 
 
+def _extract_img_timestamps(imgname_slice: List[str]) -> np.ndarray:
+    timestamps = []
+    for p in imgname_slice:
+        stem = Path(p).stem
+        ts_str = stem.split("_frame_")[0]
+        timestamps.append(int(ts_str))
+    return np.asarray(timestamps, dtype=np.int64)
+
+
 def _load_pv_txt(recording_name: str, root: Path, imgname_slice: List[str]):
     """从 PV 文件读取每帧的 pv2world，返回 world2pv 变换矩阵和 K_fullimg.
     
@@ -123,11 +132,7 @@ def _load_pv_txt(recording_name: str, root: Path, imgname_slice: List[str]):
     
     # 从 imgname 中提取 timestamps
     # 格式: timestamp_frame_xxxxx.jpg 或 path/timestamp_frame_xxxxx.jpg
-    timestamps = []
-    for p in imgname_slice:
-        stem = Path(p).stem  # timestamp_frame_xxxxx
-        ts_str = stem.split("_frame_")[0]
-        timestamps.append(int(ts_str))
+    timestamps = _extract_img_timestamps(imgname_slice)
     
     # 根据 timestamps 构建 T_w2c 和 K（精确匹配，fallback 到最近邻）
     pv_ts_keys = np.array(list(per_frame.keys()), dtype=np.int64)
@@ -178,6 +183,8 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         motion_frames=120,
         lazy_load=True,
         use_kp2d="vitpose",
+        use_ego_sensor=True,
+        ego_sensor_max_time_diff=2000000,  # HoloLens timestamp ticks; 2e6 ~= 0.2s  时间戳对齐的容忍阈值
         overfit_single_sample=False,  # 过拟合训练：只使用第一个样本
         overfit_n_samples=0,  # 过拟合训练：使用前 n 个样本
     ):
@@ -188,6 +195,8 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         self.motion_frames = motion_frames
         self.lazy_load = lazy_load
         self.use_kp2d = use_kp2d
+        self.use_ego_sensor = use_ego_sensor
+        self.ego_sensor_max_time_diff = ego_sensor_max_time_diff
         self.overfit_single_sample = overfit_single_sample
         self.overfit_n_samples = overfit_n_samples
         
@@ -196,6 +205,7 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         self._pkl_index = {}
         self._T_c2w_cache = {}
         self._T_kinect2holo_cache = {}
+        self._ego_sensor_cache = {}
 
         super().__init__()
 
@@ -269,6 +279,135 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         self._T_kinect2holo_cache[recording_name] = T
         return T
 
+    def _find_ego_sensor_csv(self, recording_name: str):
+        gaze_root = self.root / "egocentric_gaze" / recording_name
+        if not gaze_root.exists():
+            return None
+        csv_files = sorted(gaze_root.glob("*/*_head_hand_eye.csv"))
+        if len(csv_files) == 0:
+            return None
+        return csv_files[0]
+
+    def _load_ego_sensor_recording(self, recording_name: str):
+        if recording_name in self._ego_sensor_cache:
+            return self._ego_sensor_cache[recording_name]
+
+        csv_path = self._find_ego_sensor_csv(recording_name)
+        if csv_path is None:
+            Log.warning(f"[EgoBodyView1] ego sensor csv missing: {recording_name}")
+            self._ego_sensor_cache[recording_name] = None
+            return None
+
+        try:
+            # Keep float64 here: HoloLens timestamps have 18 digits and lose too much precision in float32.
+            raw = np.loadtxt(csv_path, delimiter=",", dtype=np.float64)
+        except Exception as e:
+            Log.warning(f"[EgoBodyView1] failed to load ego sensor csv {csv_path}: {e}")
+            self._ego_sensor_cache[recording_name] = None
+            return None
+
+        if raw.ndim == 1:
+            raw = raw[None]
+        if raw.shape[1] < 861:
+            Log.warning(f"[EgoBodyView1] ego sensor csv has too few columns: {csv_path}, shape={raw.shape}")
+            self._ego_sensor_cache[recording_name] = None
+            return None
+
+        joint_count = 26
+        timestamps = raw[:, 0].astype(np.int64)
+
+        head_tf = raw[:, 1:17].reshape(-1, 4, 4)
+        head_R = head_tf[:, :3, :3]
+        head_pos = head_tf[:, :3, 3]
+        head_rot6d = head_R[:, :, :2].reshape(-1, 6)
+
+        left_available = raw[:, 17:18] > 0.5
+        left_start = 18
+        left_end = left_start + joint_count * 16
+        left_hand = raw[:, left_start:left_end].reshape(-1, joint_count, 4, 4)[:, :, :3, 3]
+
+        right_available = raw[:, left_end:left_end + 1] > 0.5
+        right_start = left_end + 1
+        right_end = right_start + joint_count * 16
+        right_hand = raw[:, right_start:right_end].reshape(-1, joint_count, 4, 4)[:, :, :3, 3]
+
+        gaze_available = raw[:, 851:852] > 0.5
+        gaze_data = raw[:, 852:861]
+        gaze_origin = gaze_data[:, :3]
+        gaze_dir = gaze_data[:, 4:7]
+        gaze_dist = gaze_data[:, 8:9] / 10.0
+
+        # Use hand/gaze positions relative to the head to reduce recording-specific global offsets.
+        left_hand_rel = left_hand - head_pos[:, None, :]
+        right_hand_rel = right_hand - head_pos[:, None, :]
+        gaze_origin_rel = gaze_origin - head_pos
+
+        left_hand_rel[~left_available[:, 0]] = 0.0
+        right_hand_rel[~right_available[:, 0]] = 0.0
+        gaze_origin_rel[~gaze_available[:, 0]] = 0.0
+        gaze_dir[~gaze_available[:, 0]] = 0.0
+        gaze_dist[~gaze_available[:, 0]] = 0.0
+
+        features = np.concatenate(
+            [
+                head_rot6d,
+                head_pos,
+                left_hand_rel.reshape(raw.shape[0], -1),
+                left_available.astype(np.float64),
+                right_hand_rel.reshape(raw.shape[0], -1),
+                right_available.astype(np.float64),
+                gaze_origin_rel,
+                gaze_dir,
+                gaze_dist,
+                gaze_available.astype(np.float64),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        finite = np.isfinite(features).all(axis=1)
+        features[~finite] = 0.0
+
+        sensor = {"timestamps": timestamps, "features": features, "valid": finite}
+        self._ego_sensor_cache[recording_name] = sensor
+        return sensor
+
+    def _load_ego_sensor(self, recording_name: str, imgname_slice: List[str]):
+        F = len(imgname_slice)
+        feat_dim = 176
+        features = torch.zeros((F, feat_dim), dtype=torch.float32)
+        valid = torch.zeros((F,), dtype=torch.bool)
+        if not self.use_ego_sensor or F == 0:
+            return features, valid
+
+        sensor = self._load_ego_sensor_recording(recording_name)
+        if sensor is None:
+            return features, valid
+
+        try:
+            img_ts = _extract_img_timestamps(imgname_slice)
+        except Exception as e:
+            Log.warning(f"[EgoBodyView1] failed to parse image timestamps for {recording_name}: {e}")
+            return features, valid
+
+        sensor_ts = sensor["timestamps"]
+        idx_right = np.searchsorted(sensor_ts, img_ts, side="left")
+        idx_left = np.clip(idx_right - 1, 0, len(sensor_ts) - 1)
+        idx_right = np.clip(idx_right, 0, len(sensor_ts) - 1)
+        diff_left = np.abs(sensor_ts[idx_left] - img_ts)
+        diff_right = np.abs(sensor_ts[idx_right] - img_ts)
+        use_right = diff_right < diff_left
+        idx = np.where(use_right, idx_right, idx_left)
+        time_diff = np.minimum(diff_left, diff_right)
+
+        matched = sensor["features"][idx].copy()
+        matched_valid = sensor["valid"][idx] & (time_diff <= self.ego_sensor_max_time_diff)
+        time_diff_sec = (time_diff.astype(np.float32) / 1e7)[:, None]
+        matched = np.concatenate([matched, time_diff_sec], axis=1)
+        matched[~matched_valid] = 0.0
+
+        features = torch.tensor(matched, dtype=torch.float32)
+        valid = torch.tensor(matched_valid, dtype=torch.bool)
+        return features, valid
+
     def _load_smpl_params_for_role(self, recording: str, role: str, frame_ids: np.ndarray, mask_valid: np.ndarray):
         """加载指定 role 的 SMPLX 参数 (在 kinect12 相机坐标系下)."""
         self._build_pkl_index(recording, role)
@@ -332,6 +471,8 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
                 imgname = [str(p) for p in list(imgname_all)[start:end]]
         else:
             imgname = []
+
+        ego_sensor, ego_sensor_valid = self._load_ego_sensor(recording, imgname)
 
         # ============================================================
         # 从 PV 文件读取 T_w2c (world → PV camera) 和 K_fullimg
@@ -528,6 +669,7 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
             "f_imgseq": f_imgseq,
             "kp2d": kp2d,
             "cam_angvel": cam_angvel,
+            "ego_sensor": ego_sensor,
             "imgname": imgname,
             # Interactee 数据 (可选，用于后续 exo 头训练)
             "interactee_smpl_params_c": interactee_smpl_params_c,
@@ -538,6 +680,7 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
                 "vitpose": vitpose_flag,
                 "bbx_xys": True,
                 "f_imgseq": True,
+                "ego_sensor": ego_sensor_valid,
                 "spv_incam_only": False,
             },
         }
@@ -560,6 +703,9 @@ class EgoBodyView1Dataset(ImgfeatMotionDatasetBase):
         return_data["f_imgseq"] = repeat_to_max_len(return_data["f_imgseq"], max_len)
         return_data["kp2d"] = repeat_to_max_len(return_data["kp2d"], max_len)
         return_data["cam_angvel"] = repeat_to_max_len(return_data["cam_angvel"], max_len)
+        return_data["ego_sensor"] = repeat_to_max_len(return_data["ego_sensor"], max_len)
+        if "ego_sensor" in return_data["mask"]:
+            return_data["mask"]["ego_sensor"] = repeat_to_max_len(return_data["mask"]["ego_sensor"], max_len)
         return_data["mask"]["valid"] = get_valid_mask(max_len, length)
         
         # 处理 interactee 数据 (如果存在)

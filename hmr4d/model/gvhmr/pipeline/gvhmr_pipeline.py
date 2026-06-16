@@ -74,6 +74,7 @@ class Pipeline(nn.Module):
             "f_cliffcam": cliff_cam,  # (B, L, 3)
             "f_cam_angvel": f_cam_angvel,  # (B, L, C=6)
             "f_imgseq": inputs["f_imgseq"],  # (B, L, C=1024)
+            "f_ego_sensor": inputs.get("ego_sensor", None),  # (B, L, C=19)
         }
         if train:
             f_condition = randomly_set_null_condition(f_condition, 0.1)
@@ -173,12 +174,19 @@ class Pipeline(nn.Module):
             #         "mask": inputs["mask"],
             #     }
             # target_x = self.endecoder.encode(interactee_inputs)  # (B, L, C)
-            simple_loss_ego = F.mse_loss(pred_x_ego, target_x, reduction="none")
+            simple_loss_ego_raw = F.mse_loss(pred_x_ego, target_x, reduction="none")
             mask_simple_ego = mask[:, :, None].expand(-1, -1, pred_x_ego.size(2)).clone()
             mask_simple_ego[inputs["mask"]["spv_incam_only"], :, 142:] = False
-            simple_loss_ego = (simple_loss_ego * mask_simple_ego).mean()
+            simple_loss_ego = (simple_loss_ego_raw * mask_simple_ego).mean()
             total_loss += simple_loss_ego
             outputs["simple_loss_ego"] = simple_loss_ego
+
+            simple_part_mask = mask[:, :, None]
+            outputs["simple_body_pose_loss_ego"] = (simple_loss_ego_raw[:, :, :126] * simple_part_mask).mean()
+            outputs["simple_betas_loss_ego"] = (simple_loss_ego_raw[:, :, 126:136] * simple_part_mask).mean()
+            outputs["simple_global_orient_loss_ego"] = (simple_loss_ego_raw[:, :, 136:142] * simple_part_mask).mean()
+            outputs["simple_global_orient_gv_loss_ego"] = (simple_loss_ego_raw[:, :, 142:148] * simple_part_mask).mean()
+            outputs["simple_local_transl_vel_loss_ego"] = (simple_loss_ego_raw[:, :, 148:151] * simple_part_mask).mean()
         
         # Exo head loss (如果存在且未冻结)
         if not has_ego or not self.args.get("freeze_exo_head", False):

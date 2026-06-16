@@ -198,7 +198,8 @@ class GvhmrPL(pl.LightningModule):
         batch["obs"] = obs
         # batch["kp2d"] = torch.zeros(B, 17, 3)   # 训练阶段不用
         if True:  # Use some detected vitpose (presave data)这个后面可以用VitPose检测之后再加入训练
-            prob = 0.5
+            # prob = 0.5
+            prob = 1.0
             mask_real_vitpose = (torch.rand(B).to(obs_kp2d) < prob) * batch["mask"]["vitpose"]
             batch["obs"][mask_real_vitpose] = normalize_kp2d(batch["kp2d"], batch["bbx_xys"])[mask_real_vitpose]
 

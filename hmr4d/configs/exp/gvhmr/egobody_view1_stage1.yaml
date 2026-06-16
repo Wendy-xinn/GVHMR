@@ -26,6 +26,9 @@ model:
   val_vis_every_n_steps: 1000  # 验证集可视化间隔（每隔 N 个 step 可视化一次）
   zero_f_imgseq: false  # 实验：将 f_imgseq 置零，验证 ego 头是否可以仅从 obs/cliffcam/cam_angvel 学习
 
+network:
+  ego_sensor_dim: 176
+
 pipeline:
     _target_: hmr4d.model.gvhmr.pipeline.gvhmr_pipeline.Pipeline
     args_denoiser3d: ${network}
