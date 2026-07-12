@@ -1,0 +1,41 @@
+{
+  "recording": "recording_20210907_S02_S01_01",
+  "split": "train",
+  "num_frames": 1202,
+  "first_frame_id": 1551,
+  "last_frame_id": 2840,
+  "valid_frames": 1202,
+  "head_valid_frames": 1202,
+  "left_hand_valid_frames": 41,
+  "right_hand_valid_frames": 138,
+  "max_head_time_diff_ticks": 301816,
+  "max_pv_time_diff_ticks": 0,
+  "cpf_stats": {
+    "source": "gaze_world",
+    "requested_source": "gaze-world",
+    "num_valid_gaze_frames": 1202,
+    "translation_head_cpf": [
+      0.00017541460692882538,
+      -0.001134316436946392,
+      -0.008309975266456604
+    ],
+    "candidate_gaze_world": {
+      "translation": [
+        0.00017541460692882538,
+        -0.001134316436946392,
+        -0.008309975266456604
+      ],
+      "norm": 0.00838886946439743,
+      "num_valid": 1202
+    },
+    "candidate_gaze_head_local": {
+      "translation": [
+        0.04940585419535637,
+        0.09423129260540009,
+        0.13965049386024475
+      ],
+      "norm": 0.17556405067443848,
+      "num_valid": 1202
+    }
+  }
+}

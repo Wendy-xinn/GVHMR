@@ -16,11 +16,15 @@ class NetworkEncoderRoPE(nn.Module):
         self,
         # x
         output_dim=151,
+        ego_output_dim=None,
         max_len=120,
         # condition
         cliffcam_dim=3,
         cam_angvel_dim=6,
         imgseq_dim=1024,
+        ego_imgseq_dim=1024,
+        ego_head_dim=25,
+        ego_hand_dim=18,
         # intermediate
         latent_dim=512,
         num_layers=12,
@@ -39,12 +43,16 @@ class NetworkEncoderRoPE(nn.Module):
 
         # input
         self.output_dim = output_dim
+        self.ego_output_dim = ego_output_dim if ego_output_dim is not None else output_dim
         self.max_len = max_len
 
         # condition
         self.cliffcam_dim = cliffcam_dim
         self.cam_angvel_dim = cam_angvel_dim
         self.imgseq_dim = imgseq_dim
+        self.ego_imgseq_dim = ego_imgseq_dim
+        self.ego_head_dim = ego_head_dim
+        self.ego_hand_dim = ego_hand_dim
 
         # intermediate
         self.latent_dim = latent_dim
@@ -90,7 +98,7 @@ class NetworkEncoderRoPE(nn.Module):
         self.pred_cam_head_ego = None
         self.static_conf_head_ego = None
         if self.dual_head:
-            self.final_layer_ego = Mlp(self.latent_dim, out_features=self.output_dim)
+            self.final_layer_ego = Mlp(self.latent_dim, out_features=self.ego_output_dim)
             if self.pred_cam_head:
                 self.pred_cam_head_ego = Mlp(self.latent_dim, out_features=pred_cam_dim)
             if self.static_conf_head:
@@ -118,14 +126,48 @@ class NetworkEncoderRoPE(nn.Module):
                 nn.LayerNorm(self.imgseq_dim),
                 zero_module(nn.Linear(self.imgseq_dim, latent_dim)),
             )
+        if self.ego_imgseq_dim > 0:
+            self.ego_imgseq_embedder = nn.Sequential(
+                nn.LayerNorm(self.ego_imgseq_dim),
+                zero_module(nn.Linear(self.ego_imgseq_dim, latent_dim)),
+            )
+        if self.ego_head_dim > 0:
+            self.ego_head_embedder = nn.Sequential(
+                nn.LayerNorm(self.ego_head_dim),
+                nn.Linear(self.ego_head_dim, latent_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                zero_module(nn.Linear(latent_dim, latent_dim)),
+            )
+        if self.ego_hand_dim > 0:
+            self.ego_hand_embedder = nn.Sequential(
+                nn.LayerNorm(self.ego_hand_dim),
+                nn.Linear(self.ego_hand_dim, latent_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                zero_module(nn.Linear(latent_dim, latent_dim)),
+            )
 
-    def forward(self, length, obs=None, f_cliffcam=None, f_cam_angvel=None, f_imgseq=None):
+    def forward(
+        self,
+        length,
+        obs=None,
+        f_cliffcam=None,
+        f_cam_angvel=None,
+        f_imgseq=None,
+        f_ego_imgseq=None,
+        f_ego_head=None,
+        f_ego_hand=None,
+    ):
         """
         Args:
             x: None we do not use it
             timesteps: (B,)
             length: (B), valid length of x, if None then use x.shape[2]
-            f_imgseq: (B, L, C)
+            f_imgseq: (B, L, C), exo / third-person image feature.
+            f_ego_imgseq: (B, L, C), ego PV image feature.
+            f_ego_head: (B, L, C), compact CPF/head trajectory condition.
+            f_ego_hand: (B, L, C), optional hand/gaze condition.
             f_cliffcam: (B, L, 3), CLIFF-Cam parameters (bbx-detection in the full-image)
             f_noisyobs: (B, L, C), noisy pose observation
             f_cam_angvel: (B, L, 6), Camera angular velocity
@@ -148,6 +190,12 @@ class NetworkEncoderRoPE(nn.Module):
             f_to_add.append(self.cam_angvel_embedder(f_cam_angvel))
         if f_imgseq is not None and hasattr(self, "imgseq_embedder"):
             f_to_add.append(self.imgseq_embedder(f_imgseq))
+        if f_ego_imgseq is not None and hasattr(self, "ego_imgseq_embedder"):
+            f_to_add.append(self.ego_imgseq_embedder(f_ego_imgseq))
+        if f_ego_head is not None and hasattr(self, "ego_head_embedder"):
+            f_to_add.append(self.ego_head_embedder(f_ego_head))
+        if f_ego_hand is not None and hasattr(self, "ego_hand_embedder"):
+            f_to_add.append(self.ego_hand_embedder(f_ego_hand))
 
         for f_delta in f_to_add:
             x = x + f_delta
@@ -180,7 +228,7 @@ class NetworkEncoderRoPE(nn.Module):
         sample_ego = None
         if self.dual_head and self.final_layer_ego is not None:
             sample_ego = self.final_layer_ego(x)
-            if self.avgbeta:
+            if self.avgbeta and sample_ego.size(-1) >= 136:
                 betas = (sample_ego[..., 126:136] * (~pmask[..., None])).sum(1) / length[:, None]  # (B, C)
                 betas = repeat(betas, "b c -> b l c", l=L)
                 sample_ego = torch.cat([sample_ego[..., :126], betas, sample_ego[..., 136:]], dim=-1)

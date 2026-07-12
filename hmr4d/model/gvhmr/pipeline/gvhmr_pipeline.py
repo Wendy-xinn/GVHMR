@@ -17,10 +17,23 @@ from hmr4d.model.gvhmr.utils.postprocess import (
     process_ik,
 )
 from hmr4d.model.gvhmr.utils import stats_compose
+from hmr4d.utils.smpl_root_transform import transform_smpl_root, transform_smpl_root_to_local
+
+SMPL_BODY_KEYS = ("body_pose", "betas", "global_orient", "transl")
+
+
+def _body_smpl_params(params):
+    return {k: v for k, v in params.items() if k in SMPL_BODY_KEYS}
+
+
 
 
 def safe_masked_mean(loss, mask):
-    """计算 masked mean，防止 mask 全为 False 时得到 NaN"""
+    """Masked mean with the original mask denominator, while dropping NaN/Inf values."""
+    mask = mask.to(device=loss.device, dtype=loss.dtype)
+    while mask.ndim < loss.ndim:
+        mask = mask.unsqueeze(-1)
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
     loss = loss * mask
     num_valid = mask.sum()
     return loss.sum() / torch.clamp(num_valid, min=1)
@@ -39,6 +52,366 @@ from hmr4d.utils.geo.hmr_global import (
 )
 from hmr4d.utils.wis3d_utils import make_wis3d, add_motion_as_lines
 from hmr4d.utils.smplx_utils import make_smplx
+
+
+def _get_branch_mode(args):
+    mode = args.get("branch_mode", "both")
+    if mode not in ("exo", "ego", "both", "auto"):
+        raise ValueError(f"branch_mode must be one of exo/ego/both/auto, got {mode}")
+    return mode
+
+
+def _effective_branch_mode(inputs, branch_mode):
+    if branch_mode == "auto":
+        return "ego" if "exo" in inputs and "ego" in inputs else "exo"
+    if branch_mode in ("ego", "both") and not ("exo" in inputs and "ego" in inputs):
+        return "exo"
+    return branch_mode
+
+
+def _split_paired_inputs(inputs, branch_mode="both", input_role=None):
+    """Map paired ego/exo batches to the flat legacy fields for one routed branch.
+
+    branch_mode controls which observation/image stream feeds the shared
+    transformer. Loss gating is handled later in Pipeline.forward.
+    """
+    if "exo" not in inputs or "ego" not in inputs:
+        return inputs, None, None
+
+    exo = inputs["exo"]
+    ego = inputs["ego"]
+    flat = dict(inputs)
+
+    route_role = input_role or ("ego" if branch_mode == "ego" else "exo")
+    flat["_input_role"] = route_role
+
+    if route_role == "ego":
+        flat.update(
+            {
+                "smpl_params_c": ego.get("smpl_params_c"),
+                "smpl_params_w": ego.get("smpl_params_w"),
+                "bbx_xys": ego.get("bbx_body_xys", ego.get("bbx_xys")),
+                "f_imgseq": ego.get("f_body_imgseq", ego.get("f_imgseq")),
+                "kp2d": ego.get("kp2d_body", ego.get("kp2d")),
+                "K_fullimg": inputs.get("K_ego", inputs.get("K_fullimg")),
+            }
+        )
+    else:
+        flat.update(
+            {
+                "smpl_params_c": exo.get("smpl_params_c"),
+                "smpl_params_w": exo.get("smpl_params_w"),
+                "bbx_xys": exo.get("bbx_xys"),
+                "f_imgseq": exo.get("f_imgseq"),
+                "kp2d": exo.get("kp2d"),
+                "K_fullimg": inputs.get("K_fullimg"),
+            }
+        )
+
+    if "interactee_smpl_params_c" not in flat and flat.get("smpl_params_c") is not None:
+        flat["interactee_smpl_params_c"] = flat["smpl_params_c"]
+    if "interactee_smpl_params_w" not in flat and flat.get("smpl_params_w") is not None:
+        flat["interactee_smpl_params_w"] = flat["smpl_params_w"]
+    return flat, ego, inputs.get("ego_cond")
+
+
+
+
+def _target_inputs_for_role(inputs, role):
+    """Return a flat view whose SMPL targets come from inputs[role] when available."""
+    if role not in inputs:
+        return inputs
+    role_inputs = inputs[role]
+    out = dict(inputs)
+    if role_inputs.get("smpl_params_c") is not None:
+        out["smpl_params_c"] = role_inputs["smpl_params_c"]
+        out["interactee_smpl_params_c"] = role_inputs["smpl_params_c"]
+    if role_inputs.get("smpl_params_w") is not None:
+        out["smpl_params_w"] = role_inputs["smpl_params_w"]
+        out["interactee_smpl_params_w"] = role_inputs["smpl_params_w"]
+    if role_inputs.get("bbx_xys") is not None:
+        out["bbx_xys"] = role_inputs["bbx_xys"]
+    if role_inputs.get("kp2d") is not None:
+        out["kp2d"] = role_inputs["kp2d"]
+    if role_inputs.get("f_imgseq") is not None:
+        out["f_imgseq"] = role_inputs["f_imgseq"]
+    return out
+
+
+def _mask_for_role(inputs, role):
+    mask = inputs["mask"].get(f"{role}_valid", inputs["mask"]["valid"])
+    return mask & inputs["mask"]["valid"]
+
+
+
+def _invert_T(T):
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
+    T_inv = torch.zeros_like(T)
+    T_inv[..., :3, :3] = R.mT
+    T_inv[..., :3, 3] = -(R.mT @ t[..., None]).squeeze(-1)
+    T_inv[..., 3, 3] = 1
+    return T_inv
+
+
+def _transform_root_to_local(global_orient_w, transl_w, T_w_local, betas=None):
+    return transform_smpl_root_to_local(global_orient_w, transl_w, T_w_local, betas)
+
+
+def _transform_root_to_world(global_orient_local, transl_local, T_w_local, betas=None):
+    return transform_smpl_root(global_orient_local, transl_local, T_w_local, betas)
+
+
+def _transform_root_from_opencv_cam_to_world(global_orient_c, transl_c, T_w_pv, betas=None):
+    """Lift OpenCV-camera SMPL root parameters to dataset/canonical world using PV pose."""
+    C = torch.eye(4, device=transl_c.device, dtype=transl_c.dtype)
+    C[:3, :3] = torch.diag(torch.tensor([1.0, -1.0, -1.0], device=transl_c.device, dtype=transl_c.dtype))
+    while C.ndim < T_w_pv.ndim:
+        C = C.unsqueeze(0)
+    T_w_c = T_w_pv @ C
+    return transform_smpl_root(global_orient_c, transl_c, T_w_c, betas)
+
+
+def _smpl_params_incam_to_world(smpl_params_c, T_w_pv):
+    global_orient_w, transl_w = _transform_root_from_opencv_cam_to_world(
+        smpl_params_c["global_orient"], smpl_params_c["transl"], T_w_pv, smpl_params_c.get("betas")
+    )
+    return {
+        "body_pose": smpl_params_c["body_pose"],
+        "betas": smpl_params_c["betas"],
+        "global_orient": global_orient_w,
+        "transl": transl_w,
+    }
+
+
+def _identity_T_like(transl):
+    T = torch.eye(4, device=transl.device, dtype=transl.dtype)
+    return T.expand(*transl.shape[:-1], 4, 4).clone()
+
+
+def _make_fixed_observer_ego_cond(inputs, base_ego_cond=None, cfg=None):
+    """Create a virtual head/CPF trajectory for exo-camera input.
+
+    Ego CPF decoding expects a body-centric head/CPF trajectory, not a generic
+    camera pose. For fixed or moving exo cameras we synthesize a simple observer
+    standing behind the camera, facing the camera forward direction.
+    """
+    cfg = cfg or {}
+    bbx = inputs["bbx_xys"]
+    B, L = bbx.shape[:2]
+    device, dtype = bbx.device, bbx.dtype
+
+    T_world_cam = inputs.get("T_world_cam", inputs.get("T_world_exo_cam", None))
+    if T_world_cam is None:
+        T_world_cam = torch.eye(4, device=device, dtype=dtype).reshape(1, 1, 4, 4).repeat(B, L, 1, 1)
+    else:
+        T_world_cam = T_world_cam.to(device=device, dtype=dtype)
+        if T_world_cam.ndim == 3:
+            T_world_cam = T_world_cam.unsqueeze(0)
+        if T_world_cam.shape[0] == 1 and B > 1:
+            T_world_cam = T_world_cam.expand(B, -1, -1, -1)
+        if T_world_cam.shape[1] == 1 and L > 1:
+            T_world_cam = T_world_cam.expand(-1, L, -1, -1)
+        T_world_cam = T_world_cam[:, :L]
+
+    if "head_camera_offset" in cfg:
+        offset = torch.as_tensor(cfg["head_camera_offset"], device=device, dtype=dtype)
+        if offset.numel() != 3:
+            raise ValueError("virtual_ego_from_exo.head_camera_offset must have 3 values: [x, y, z]")
+        offset = offset.reshape(3)
+    else:
+        head_height = float(cfg.get("height", 1.6))
+        back_offset = float(cfg.get("back_offset", 0.6))
+        height_mode = cfg.get("height_mode", "floor_relative")
+        if height_mode == "floor_relative":
+            # Legacy mode: infer camera->head/CPF y offset from two height priors.
+            camera_height = float(cfg.get("camera_height", 1.1))
+            virtual_y = head_height - camera_height
+        elif height_mode == "camera_relative":
+            virtual_y = head_height
+        else:
+            raise ValueError(f"Unsupported virtual_ego_from_exo.height_mode: {height_mode}")
+        offset = torch.tensor([0.0, virtual_y, back_offset], device=device, dtype=dtype)
+
+    # Real EgoBody PV/head rotations are nearly identical; CPF then applies
+    # T_head_cpf.R = diag([-1, 1, -1]). Do not apply that flip twice here,
+    # otherwise the synthesized CPF frame faces the opposite convention.
+    T_cam_head = torch.eye(4, device=device, dtype=dtype)
+    T_cam_head[:3, 3] = offset
+    T_cam_head = T_cam_head.reshape(1, 1, 4, 4).repeat(B, L, 1, 1)
+
+    T_head_cpf = torch.eye(4, device=device, dtype=dtype)
+    T_head_cpf[:3, :3] = torch.diag(torch.tensor([-1.0, 1.0, -1.0], device=device, dtype=dtype))
+    if "head_cpf_offset" in cfg:
+        head_cpf_offset = torch.as_tensor(cfg["head_cpf_offset"], device=device, dtype=dtype)
+        if head_cpf_offset.numel() != 3:
+            raise ValueError("virtual_ego_from_exo.head_cpf_offset must have 3 values: [x, y, z]")
+        T_head_cpf[:3, 3] = head_cpf_offset.reshape(3)
+    T_head_cpf = T_head_cpf.reshape(1, 1, 4, 4).repeat(B, L, 1, 1)
+
+    T_world_head = T_world_cam @ T_cam_head
+    T_world_cpf = T_world_head @ T_head_cpf
+    cond = dict(base_ego_cond) if base_ego_cond is not None else {}
+    cond["T_world_cpf"] = T_world_cpf
+    cond["T_world_head"] = T_world_head
+    cond["T_world_pv"] = T_world_cam
+    cond["head_valid"] = torch.ones((B, L), device=device, dtype=torch.bool)
+    cond["head_angvel"] = torch.zeros((B, L, 6), device=device, dtype=dtype)
+    cond["virtual_ego_from_exo"] = torch.ones((B, L), device=device, dtype=torch.bool)
+    return cond
+
+
+def _smpl_params_incam_to_input_world(smpl_params_c, inputs):
+    """Lift OpenCV-camera SMPL root params into the active input camera's world frame."""
+    T_world_cam = None
+    if inputs.get("_input_role", None) == "ego":
+        ego_cond = inputs.get("ego_cond", None)
+        if isinstance(ego_cond, dict):
+            T_world_cam = ego_cond.get("T_world_pv", None)
+    if T_world_cam is None:
+        T_world_cam = inputs.get("T_world_cam", inputs.get("T_world_exo_cam", None))
+    if T_world_cam is None:
+        T_world_cam = _identity_T_like(smpl_params_c["transl"])
+    return _smpl_params_incam_to_world(smpl_params_c, T_world_cam)
+
+
+def _smpl_params_incam_to_kinect_yup(smpl_params_c):
+    """Legacy fallback for old camera-axis worlds without T_world_cam."""
+    return _smpl_params_incam_to_world(smpl_params_c, _identity_T_like(smpl_params_c["transl"]))
+
+
+def _decode_ego_cpf_x(pred_x_ego):
+    B, L = pred_x_ego.shape[:2]
+    body_pose_r6d = pred_x_ego[..., :126]
+    betas = pred_x_ego[..., 126:136]
+    root_orient_cpf_r6d = pred_x_ego[..., 136:142]
+    root_trans_cpf = pred_x_ego[..., 142:145]
+    body_pose = matrix_to_axis_angle(rotation_6d_to_matrix(body_pose_r6d.reshape(B, L, -1, 6))).flatten(-2)
+    root_orient_cpf = matrix_to_axis_angle(rotation_6d_to_matrix(root_orient_cpf_r6d))
+    return {
+        "body_pose": body_pose,
+        "betas": betas,
+        "root_orient_cpf": root_orient_cpf,
+        "root_trans_cpf": root_trans_cpf,
+    }
+
+
+def _encode_ego_cpf_targets(inputs):
+    ego_targets = _target_inputs_for_role(inputs, "ego")
+    ego_cond = inputs.get("ego_cond", {})
+    if "T_world_cpf" not in ego_cond:
+        raise KeyError("ego_cond['T_world_cpf'] is required for CPF-local ego supervision")
+    smpl_c = ego_targets["smpl_params_c"]
+    smpl_w = ego_targets["smpl_params_w"]
+    B, L = smpl_c["body_pose"].shape[:2]
+    body_pose = smpl_c["body_pose"].reshape(B, L, 21, 3)
+    body_pose_r6d = matrix_to_rotation_6d(axis_angle_to_matrix(body_pose)).flatten(-2)
+    root_orient_cpf, root_trans_cpf = _transform_root_to_local(
+        smpl_w["global_orient"], smpl_w["transl"], ego_cond["T_world_cpf"], smpl_w.get("betas")
+    )
+    root_orient_cpf_r6d = matrix_to_rotation_6d(axis_angle_to_matrix(root_orient_cpf))
+    return torch.cat([body_pose_r6d, smpl_c["betas"], root_orient_cpf_r6d, root_trans_cpf], dim=-1)
+
+
+def _ego_cpf_to_smpl_params_world(decode_dict_ego, ego_cond):
+    if "T_world_cpf" not in ego_cond:
+        return None
+    global_orient_w, transl_w = _transform_root_to_world(
+        decode_dict_ego["root_orient_cpf"], decode_dict_ego["root_trans_cpf"], ego_cond["T_world_cpf"], decode_dict_ego.get("betas")
+    )
+    return {
+        "body_pose": decode_dict_ego["body_pose"],
+        "betas": decode_dict_ego["betas"],
+        "global_orient": global_orient_w,
+        "transl": transl_w,
+    }
+
+
+def _ego_cpf_target_params(inputs):
+    ego_targets = _target_inputs_for_role(inputs, "ego")
+    ego_cond = inputs.get("ego_cond", {})
+    root_orient_cpf, root_trans_cpf = _transform_root_to_local(
+        ego_targets["smpl_params_w"]["global_orient"],
+        ego_targets["smpl_params_w"]["transl"],
+        ego_cond["T_world_cpf"],
+        ego_targets["smpl_params_w"].get("betas"),
+    )
+    return {
+        "body_pose": ego_targets["smpl_params_c"]["body_pose"],
+        "betas": ego_targets["smpl_params_c"]["betas"],
+        "global_orient": root_orient_cpf,
+        "transl": root_trans_cpf,
+    }
+
+def _axis_angle_y(angle):
+    aa = torch.zeros((*angle.shape, 3), device=angle.device, dtype=angle.dtype)
+    aa[..., 1] = angle
+    return aa
+
+
+def _make_ego_head_condition(ego_cond):
+    """CPF/head condition inspired by EgoAllo's non-redundant trajectory encoding.
+
+    Output dimension is 25:
+        relative rotation 6D, relative translation in previous CPF/head frame 3D,
+        height 1D, yaw-canonicalized rotation 6D, linear velocity 3D,
+        relative angular velocity 6D.
+    """
+    if ego_cond is None:
+        return None
+    T = None
+    for key in ("T_world_cpf", "T_holo_cpf", "T_world_head", "T_holo_head"):
+        if key in ego_cond:
+            T = ego_cond[key]
+            break
+    if T is None:
+        return None
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
+    B, L = t.shape[:2]
+
+    rel_R = torch.eye(3, device=T.device, dtype=T.dtype).expand(B, L, 3, 3).clone()
+    rel_t = torch.zeros((B, L, 3), device=T.device, dtype=T.dtype)
+    if L > 1:
+        rel_R[:, 1:] = R[:, :-1].mT @ R[:, 1:]
+        rel_t[:, 1:] = torch.einsum("blij,blj->bli", R[:, :-1].mT, t[:, 1:] - t[:, :-1])
+    rel_r6d = matrix_to_rotation_6d(rel_R)
+
+    # Holo/EgoBody and GVHMR training coordinates are y-up in our preprocessing.
+    height = t[..., [1]]
+    vel = torch.zeros_like(t)
+    if L > 1:
+        vel[:, 1:] = t[:, 1:] - t[:, :-1]
+
+    forward = R[..., :, 2]
+    yaw = torch.atan2(forward[..., 0], forward[..., 2])
+    R_canon = axis_angle_to_matrix(_axis_angle_y(-yaw)) @ R
+    canon_r6d = matrix_to_rotation_6d(R_canon)
+
+    if "head_angvel" in ego_cond:
+        angvel = ego_cond["head_angvel"]
+    else:
+        angvel = rel_r6d
+    return torch.cat([rel_r6d, rel_t, height, canon_r6d, vel, angvel], dim=-1)
+
+
+def _make_ego_hand_condition(ego_cond):
+    if ego_cond is None:
+        return None
+    left = None
+    right = None
+    for key in ("left_hand_summary", "left_hand_summary_holo"):
+        if key in ego_cond:
+            left = ego_cond[key]
+            break
+    for key in ("right_hand_summary", "right_hand_summary_holo"):
+        if key in ego_cond:
+            right = ego_cond[key]
+            break
+    if left is None or right is None:
+        return None
+    # First version uses wrist/palm/palm-normal summaries from each hand.
+    return torch.cat([left[..., :9], right[..., :9]], dim=-1)
 
 
 class Pipeline(nn.Module):
@@ -62,6 +435,24 @@ class Pipeline(nn.Module):
 
     def forward(self, inputs, train=False, postproc=False, static_cam=False):
         outputs = dict()
+        branch_mode = _get_branch_mode(self.args)
+        branch_mode = _effective_branch_mode(inputs, branch_mode)
+        active_exo = branch_mode in ("exo", "both")
+        active_ego = branch_mode in ("ego", "both")
+        input_role = inputs.get("_input_role", self.args.get("input_role", None))
+        if input_role == "auto":
+            input_role = None
+        supervise_role = inputs.get("_supervise_role", self.args.get("supervise_role", None))
+        if supervise_role is None or supervise_role == "auto":
+            supervise_role = branch_mode
+        inputs, ego_inputs, ego_cond = _split_paired_inputs(inputs, branch_mode, input_role=input_role)
+        input_role = inputs.get("_input_role", input_role or ("ego" if branch_mode == "ego" else "exo"))
+        virtual_ego_cfg = self.args.get("virtual_ego_from_exo", {})
+        if active_ego and input_role == "exo" and virtual_ego_cfg.get("enabled", False):
+            mode = virtual_ego_cfg.get("mode", "fixed_observer")
+            if mode != "fixed_observer":
+                raise ValueError(f"Unsupported virtual_ego_from_exo.mode: {mode}")
+            ego_cond = _make_fixed_observer_ego_cond(inputs, ego_cond, virtual_ego_cfg)
         length = inputs["length"]  # (B,) effective length of each sample
 
         # *. Conditions
@@ -74,50 +465,114 @@ class Pipeline(nn.Module):
             "f_cliffcam": cliff_cam,  # (B, L, 3)
             "f_cam_angvel": f_cam_angvel,  # (B, L, C=6)
             "f_imgseq": inputs["f_imgseq"],  # (B, L, C=1024)
+            "f_ego_head": _make_ego_head_condition(ego_cond) if active_ego else None,
+            "f_ego_hand": _make_ego_hand_condition(ego_cond) if active_ego else None,
         }
-        if train:
+        if branch_mode == "both" and ego_inputs is not None and self.args.get("add_other_role_image_condition", False):
+            f_ego_imgseq = ego_inputs.get("f_body_imgseq", ego_inputs.get("f_imgseq"))
+            if f_ego_imgseq is not None:
+                f_condition["f_ego_imgseq"] = f_ego_imgseq
+        if train and self.training:
             f_condition = randomly_set_null_condition(f_condition, 0.1)
 
         # Forward & output
         model_output = self.denoiser3d(length=length, **f_condition)  # pred_x, pred_cam, static_conf_logits
-        decode_dict = self.endecoder.decode(model_output["pred_x"])  # (B, L, C) -> dict
-        outputs.update({"model_output": model_output, "decode_dict": decode_dict})
+        frozen_ego_feature = None
+        if ego_inputs is not None:
+            frozen_ego_feature = ego_inputs.get("f_body_imgseq", ego_inputs.get("f_imgseq"))
+        if active_ego and self.args.get("enable_frozen_ego_image_exo", False) and frozen_ego_feature is not None:
+            with torch.no_grad():
+                frozen_condition = dict(f_condition)
+                frozen_condition["f_imgseq"] = frozen_ego_feature
+                frozen_condition["f_ego_imgseq"] = None
+                frozen_condition["f_ego_head"] = None
+                frozen_condition["f_ego_hand"] = None
+                frozen_output = self.denoiser3d(length=length, **frozen_condition)
+                frozen_decode = self.endecoder.decode(frozen_output["pred_x"].detach())
+                frozen_global = get_smpl_params_w_Rt_v2(
+                    global_orient_gv=frozen_decode["global_orient_gv"],
+                    local_transl_vel=frozen_decode["local_transl_vel"],
+                    global_orient_c=frozen_decode["global_orient"],
+                    cam_angvel=inputs["cam_angvel"],
+                )
+                outputs["frozen_ego_image_exo_decode_dict"] = frozen_decode
+                outputs["frozen_ego_image_exo_incam"] = {
+                    "body_pose": frozen_decode["body_pose"],
+                    "betas": frozen_decode["betas"],
+                    "global_orient": frozen_decode["global_orient"],
+                    "transl": compute_transl_full_cam(frozen_output["pred_cam"].detach(), inputs["bbx_xys"], inputs["K_fullimg"]),
+                }
+                outputs["frozen_ego_image_exo_kinect_from_incam"] = _smpl_params_incam_to_input_world(
+                    outputs["frozen_ego_image_exo_incam"], inputs
+                )
+                if ego_cond is not None and "T_world_pv" in ego_cond:
+                    outputs["frozen_ego_image_exo_world_from_pv"] = _smpl_params_incam_to_world(
+                        outputs["frozen_ego_image_exo_incam"], ego_cond["T_world_pv"]
+                    )
+                outputs["frozen_ego_image_exo_global"] = {
+                    "body_pose": frozen_decode["body_pose"],
+                    "betas": frozen_decode["betas"],
+                    **frozen_global,
+                }
+        decode_dict = self.endecoder.decode(model_output["pred_x"]) if active_exo else None
+        outputs.update({"model_output": model_output})
+        if decode_dict is not None:
+            outputs["decode_dict"] = decode_dict
         decode_dict_ego = None
-        if "pred_x_ego" in model_output:
-            decode_dict_ego = self.endecoder.decode(model_output["pred_x_ego"])
+        if active_ego and "pred_x_ego" in model_output:
+            if model_output["pred_x_ego"].size(-1) == 145 or self.args.get("ego_head_type", "cpf") == "cpf":
+                decode_dict_ego = _decode_ego_cpf_x(model_output["pred_x_ego"])
+            else:
+                decode_dict_ego = self.endecoder.decode(model_output["pred_x_ego"])
             outputs.update({"decode_dict_ego": decode_dict_ego})
 
         # Post-processing
-        outputs["pred_smpl_params_incam"] = {
-            "body_pose": decode_dict["body_pose"],  # (B, L, 63)
-            "betas": decode_dict["betas"],  # (B, L, 10)
-            "global_orient": decode_dict["global_orient"],  # (B, L, 3)
-            "transl": compute_transl_full_cam(model_output["pred_cam"], inputs["bbx_xys"], inputs["K_fullimg"]),
-        }
-        if decode_dict_ego is not None:
-            # 阶段A：使用 bbx_xys（数据集返回的就是 ego 的 bbox）
-            outputs["pred_smpl_params_incam_ego"] = {
-                "body_pose": decode_dict_ego["body_pose"],
-                "betas": decode_dict_ego["betas"],
-                "global_orient": decode_dict_ego["global_orient"],
-                "transl": compute_transl_full_cam(model_output["pred_cam_ego"], inputs["bbx_xys"], inputs["K_fullimg"]),  # 数据集这里已经处理成ego了
+        if active_exo:
+            outputs["pred_smpl_params_incam"] = {
+                "body_pose": decode_dict["body_pose"],  # (B, L, 63)
+                "betas": decode_dict["betas"],  # (B, L, 10)
+                "global_orient": decode_dict["global_orient"],  # (B, L, 3)
+                "transl": compute_transl_full_cam(model_output["pred_cam"], inputs["bbx_xys"], inputs["K_fullimg"]),
             }
+            outputs["pred_smpl_params_kinect_from_incam"] = _smpl_params_incam_to_input_world(
+                outputs["pred_smpl_params_incam"], inputs
+            )
+        if decode_dict_ego is not None:
+            if "root_orient_cpf" in decode_dict_ego:
+                outputs["pred_smpl_params_cpf_ego"] = {
+                    "body_pose": decode_dict_ego["body_pose"],
+                    "betas": decode_dict_ego["betas"],
+                    "global_orient": decode_dict_ego["root_orient_cpf"],
+                    "transl": decode_dict_ego["root_trans_cpf"],
+                }
+                if ego_cond is not None:
+                    pred_world_ego = _ego_cpf_to_smpl_params_world(decode_dict_ego, ego_cond)
+                    if pred_world_ego is not None:
+                        outputs["pred_smpl_params_global_ego"] = pred_world_ego
+            else:
+                outputs["pred_smpl_params_incam_ego"] = {
+                    "body_pose": decode_dict_ego["body_pose"],
+                    "betas": decode_dict_ego["betas"],
+                    "global_orient": decode_dict_ego["global_orient"],
+                    "transl": compute_transl_full_cam(model_output["pred_cam_ego"], inputs["bbx_xys"], inputs["K_fullimg"]),
+                }
 
         if not train:
-            pred_smpl_params_global = get_smpl_params_w_Rt_v2(  # This function has for-loop
-                global_orient_gv=decode_dict["global_orient_gv"],
-                local_transl_vel=decode_dict["local_transl_vel"],
-                global_orient_c=decode_dict["global_orient"],
-                cam_angvel=inputs["cam_angvel"],
-            )
-            outputs["pred_smpl_params_global"] = {
-                "body_pose": decode_dict["body_pose"],
-                "betas": decode_dict["betas"],
-                **pred_smpl_params_global,
-            }
-            outputs["static_conf_logits"] = model_output["static_conf_logits"]
+            if active_exo:
+                pred_smpl_params_global = get_smpl_params_w_Rt_v2(  # This function has for-loop
+                    global_orient_gv=decode_dict["global_orient_gv"],
+                    local_transl_vel=decode_dict["local_transl_vel"],
+                    global_orient_c=decode_dict["global_orient"],
+                    cam_angvel=inputs["cam_angvel"],
+                )
+                outputs["pred_smpl_params_global"] = {
+                    "body_pose": decode_dict["body_pose"],
+                    "betas": decode_dict["betas"],
+                    **pred_smpl_params_global,
+                }
+                outputs["static_conf_logits"] = model_output["static_conf_logits"]
 
-            if decode_dict_ego is not None:
+            if decode_dict_ego is not None and "root_orient_cpf" not in decode_dict_ego:
                 pred_smpl_params_global_ego = get_smpl_params_w_Rt_v2(
                     global_orient_gv=decode_dict_ego["global_orient_gv"],
                     local_transl_vel=decode_dict_ego["local_transl_vel"],
@@ -130,13 +585,16 @@ class Pipeline(nn.Module):
                     **pred_smpl_params_global_ego,
                 }
                 outputs["static_conf_logits_ego"] = model_output["static_conf_logits_ego"]
+            elif decode_dict_ego is not None:
+                outputs["static_conf_logits_ego"] = model_output.get("static_conf_logits_ego", None)
 
             if postproc:  # apply post-processing
                 # Exo post-processing
-                if static_cam:  # extra post-processing to utilize static camera prior
-                    outputs["pred_smpl_params_global"]["transl"] = pp_static_joint_cam(outputs, self.endecoder)
-                else:
-                    outputs["pred_smpl_params_global"]["transl"] = pp_static_joint(outputs, self.endecoder)
+                if active_exo:
+                    if static_cam:  # extra post-processing to utilize static camera prior
+                        outputs["pred_smpl_params_global"]["transl"] = pp_static_joint_cam(outputs, self.endecoder)
+                    else:
+                        outputs["pred_smpl_params_global"]["transl"] = pp_static_joint(outputs, self.endecoder)
                 
                 # Ego post-processing (如果存在)
                 if decode_dict_ego is not None:
@@ -144,10 +602,11 @@ class Pipeline(nn.Module):
                         outputs["pred_smpl_params_global_ego"]["transl"] = pp_static_joint_cam_ego(outputs, self.endecoder)
                     else:
                         outputs["pred_smpl_params_global_ego"]["transl"] = pp_static_joint_ego(outputs, self.endecoder)
-                body_pose = process_ik(outputs, self.endecoder)
-                decode_dict["body_pose"] = body_pose
-                outputs["pred_smpl_params_global"]["body_pose"] = body_pose
-                outputs["pred_smpl_params_incam"]["body_pose"] = body_pose
+                if active_exo:
+                    body_pose = process_ik(outputs, self.endecoder)
+                    decode_dict["body_pose"] = body_pose
+                    outputs["pred_smpl_params_global"]["body_pose"] = body_pose
+                    outputs["pred_smpl_params_incam"]["body_pose"] = body_pose
 
             return outputs
 
@@ -155,26 +614,31 @@ class Pipeline(nn.Module):
         total_loss = 0
         mask = inputs["mask"]["valid"]  # (B, L)
 
-        has_ego = "pred_x_ego" in model_output
+        has_ego = active_ego and "pred_x_ego" in model_output
+        supervise_ego = supervise_role in ("ego", "both")
+        supervise_exo = supervise_role in ("exo", "both")
         
         # 1. Simple loss: MSE
         # Ego head loss (如果存在)
-        if has_ego:
+        if has_ego and supervise_ego:
             pred_x_ego = model_output["pred_x_ego"]
             if torch.isnan(pred_x_ego).any() or torch.isinf(pred_x_ego).any():
                 Log.warning("NaN/Inf found in pred_x_ego! Setting to zero.")
                 pred_x_ego = torch.nan_to_num(pred_x_ego, nan=0.0, posinf=1e3, neginf=-1e3)
             
-            target_x = self.endecoder.encode(inputs)  # (B, L, C)
+            if pred_x_ego.size(-1) == 145 or self.args.get("ego_head_type", "cpf") == "cpf":
+                target_x = _encode_ego_cpf_targets(inputs)
+            else:
+                ego_targets = _target_inputs_for_role(inputs, "ego")
+                target_x = self.endecoder.encode(ego_targets)  # (B, L, C)
             simple_loss_ego = F.mse_loss(pred_x_ego, target_x, reduction="none")
-            mask_simple_ego = mask[:, :, None].expand(-1, -1, pred_x_ego.size(2)).clone()
-            mask_simple_ego[inputs["mask"]["spv_incam_only"], :, 142:] = False
-            simple_loss_ego = (simple_loss_ego * mask_simple_ego).mean()
+            ego_mask = _mask_for_role(inputs, "ego")
+            simple_loss_ego = safe_masked_mean(simple_loss_ego, ego_mask[:, :, None])
             total_loss += simple_loss_ego
             outputs["simple_loss_ego"] = simple_loss_ego
         
         # Exo head loss (如果存在且未冻结)
-        if not has_ego or not self.args.get("freeze_exo_head", False):
+        if active_exo and supervise_exo and (not has_ego or not self.args.get("freeze_exo_head", False)):
             pred_x = model_output["pred_x"]
             if torch.isnan(pred_x).any() or torch.isinf(pred_x).any():
                 Log.warning("NaN/Inf found in pred_x! Setting to zero.")
@@ -183,14 +647,17 @@ class Pipeline(nn.Module):
             target_x = self.endecoder.encode(inputs)
             simple_loss = F.mse_loss(pred_x, target_x, reduction="none")
             mask_simple = mask[:, :, None].expand(-1, -1, pred_x.size(2)).clone()
-            mask_simple[inputs["mask"]["spv_incam_only"], :, 142:] = False
+            spv_mask = inputs["mask"]["spv_incam_only"]
+            if spv_mask.ndim == 1:
+                spv_mask = spv_mask[:, None].expand_as(mask)
+            mask_simple[..., 142:] = mask_simple[..., 142:] & (~spv_mask[..., None])
             simple_loss = (simple_loss * mask_simple).mean()
             total_loss += simple_loss
             outputs["simple_loss"] = simple_loss
 
         # 2. Extra loss
         # Ego extra loss (如果存在)
-        if has_ego:
+        if has_ego and supervise_ego:
             ego_extra_loss, ego_extra_loss_dict = compute_extra_incam_loss_ego(inputs, outputs, self)
             total_loss += ego_extra_loss
             outputs.update(ego_extra_loss_dict)
@@ -201,7 +668,7 @@ class Pipeline(nn.Module):
             outputs.update(ego_global_loss_dict)
         
         # Exo extra loss (如果存在且未冻结)
-        if not has_ego or not self.args.get("freeze_exo_head", False):
+        if active_exo and supervise_exo and (not has_ego or not self.args.get("freeze_exo_head", False)):
             extra_funcs = [
                 compute_extra_incam_loss,
                 compute_extra_global_loss,
@@ -222,91 +689,112 @@ def randomly_set_null_condition(f_condition, uncond_prob=0.1):
         if f_condition[k] is None:
             continue
         f_condition[k] = f_condition[k].clone()
-        mask = torch.rand(f_condition[k].shape[:2]) < uncond_prob
+        mask = torch.rand(f_condition[k].shape[:2], device=f_condition[k].device) < uncond_prob
         f_condition[k][mask] = 0.0
     return f_condition
 
 
 def compute_extra_incam_loss_ego(inputs, outputs, ppl):
-    """Ego 头的 incam loss：不使用 2D 重投影监督（第一人称视角人体大部分在画面外）"""
-    model_output = outputs["model_output"]
+    """Ego CPF-local body loss. Reprojection is intentionally not used."""
     endecoder = ppl.endecoder
     weights = ppl.weights
 
     extra_loss_dict = {}
     extra_loss = 0
-    mask = inputs["mask"]["valid"]
+    mask = _mask_for_role(inputs, "ego")
 
-    # 使用 ego 输出
-    pred_smpl_params = outputs["pred_smpl_params_incam_ego"]
+    if "pred_smpl_params_cpf_ego" in outputs:
+        pred_smpl_params = outputs["pred_smpl_params_cpf_ego"]
+        gt_smpl_params = _ego_cpf_target_params(inputs)
+    else:
+        pred_smpl_params = outputs["pred_smpl_params_incam_ego"]
+        ego_targets = _target_inputs_for_role(inputs, "ego")
+        gt_smpl_params = ego_targets["smpl_params_c"]
 
-    # Incam FK
-    pred_c_j3d = endecoder.fk_v2(**pred_smpl_params)
-    pred_cr_j3d = pred_c_j3d - pred_c_j3d[:, :, :1]  # (B, L, J, 3)
-    
-    # GT
-    gt_c_j3d = endecoder.fk_v2(**inputs["smpl_params_c"])
-    gt_cr_j3d = gt_c_j3d - gt_c_j3d[:, :, :1]
+    pred_j3d = endecoder.fk_v2(**_body_smpl_params(pred_smpl_params))
+    pred_cr_j3d = pred_j3d - pred_j3d[:, :, :1]
+    gt_j3d = endecoder.fk_v2(**_body_smpl_params(gt_smpl_params))
+    gt_cr_j3d = gt_j3d - gt_j3d[:, :, :1]
 
-    # Root aligned C-MPJPE Loss
     if weights.cr_j3d > 0.0:
         cr_j3d_loss = F.mse_loss(pred_cr_j3d, gt_cr_j3d, reduction="none")
         cr_j3d_loss = safe_masked_mean(cr_j3d_loss, mask[..., None, None])
         extra_loss += cr_j3d_loss * weights.cr_j3d
         extra_loss_dict["cr_j3d_loss_ego"] = cr_j3d_loss
 
-    # Ego 头不使用 transl_c loss（重投影无意义）
-    # Ego 头不使用 j2d loss（重投影无意义）
-
-    # 3D 顶点 loss（root-aligned）
     if weights.cr_verts > 0:
-        pred_c_verts437, pred_c_j17 = endecoder.smplx_model(**pred_smpl_params)
-        root_ = pred_c_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
-        pred_cr_verts437 = pred_c_verts437 - root_
+        pred_verts437, pred_j17 = endecoder.smplx_model(**_body_smpl_params(pred_smpl_params))
+        pred_root = pred_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
+        pred_cr_verts437 = pred_verts437 - pred_root
 
-        gt_cr_verts437 = inputs["gt_cr_verts437"]
+        gt_verts437, gt_j17 = endecoder.smplx_model(**_body_smpl_params(gt_smpl_params))
+        gt_root = gt_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
+        gt_cr_verts437 = gt_verts437 - gt_root
+
         cr_vert_loss = F.mse_loss(pred_cr_verts437, gt_cr_verts437, reduction="none")
         cr_vert_loss = safe_masked_mean(cr_vert_loss, mask[:, :, None, None])
         extra_loss += cr_vert_loss * weights.cr_verts
         extra_loss_dict["cr_verts_loss_ego"] = cr_vert_loss
 
-    # Ego 头不使用 verts2d loss（重投影无意义）
-
     return extra_loss, extra_loss_dict
 
 
 def compute_extra_global_loss_ego(inputs, outputs, ppl):
-    """Ego 头的 global loss：主要监督全局位置和静态置信度"""
-    decode_dict_ego = outputs["decode_dict_ego"]
+    """Ego world loss after lifting CPF-local prediction by T_world_cpf."""
     endecoder = ppl.endecoder
     weights = ppl.weights
     args = ppl.args
 
     extra_loss_dict = {}
     extra_loss = 0
-    mask = inputs["mask"]["valid"].clone()
-    mask[inputs["mask"]["spv_incam_only"]] = False
+    ego_targets = _target_inputs_for_role(inputs, "ego")
+    mask = _mask_for_role(inputs, "ego").clone()
+    spv_mask = inputs["mask"].get("spv_incam_only", torch.zeros_like(mask, dtype=torch.bool))
+    if spv_mask.ndim == 1:
+        spv_mask = spv_mask[:, None].expand_as(mask)
+    mask = mask & (~spv_mask.bool())
 
     model_output = outputs["model_output"]
-    static_conf_logits_ego = model_output["static_conf_logits_ego"]
+    static_conf_logits_ego = model_output.get("static_conf_logits_ego", None)
+    pred_world = outputs.get("pred_smpl_params_global_ego", None)
 
-    if weights.transl_w > 0:
-        gt_transl_w = inputs["smpl_params_w"]["transl"]
-        gt_global_orient_w = inputs["smpl_params_w"]["global_orient"]
-        local_transl_vel = decode_dict_ego["local_transl_vel"]
-        pred_transl_w = rollout_local_transl_vel(local_transl_vel, gt_global_orient_w, gt_transl_w[:, [0]])
+    gt_w_j3d_for_head = None
 
-        trans_w_loss = F.l1_loss(pred_transl_w, gt_transl_w, reduction="none")
+    if pred_world is not None and weights.transl_w > 0:
+        trans_w_loss = F.l1_loss(pred_world["transl"], ego_targets["smpl_params_w"]["transl"], reduction="none")
         trans_w_loss = safe_masked_mean(trans_w_loss, mask[..., None])
         extra_loss += trans_w_loss * weights.transl_w
         extra_loss_dict["transl_w_loss_ego"] = trans_w_loss
 
-    # Static-Conf loss
-    if weights.static_conf_bce > 0:
+    ego_head_weight = weights.get("ego_head_trans", 0.0)
+    if pred_world is not None and ego_head_weight > 0 and "ego_cond" in inputs:
+        ego_cond = inputs["ego_cond"]
+        if "T_world_head" in ego_cond:
+            pred_w_j3d = endecoder.fk_v2(**_body_smpl_params(pred_world))
+            head_joint_id = int(args.get("ego_head_joint_id", 15))
+            pred_head = pred_w_j3d[:, :, head_joint_id]
+            head_loss_target = args.get("ego_head_loss_target", "smpl_head_gt")
+            if head_loss_target == "sensor_head":
+                gt_head = ego_cond["T_world_head"][..., :3, 3]
+            elif head_loss_target == "smpl_head_gt":
+                if gt_w_j3d_for_head is None:
+                    gt_w_j3d_for_head = endecoder.fk_v2(**_body_smpl_params(ego_targets["smpl_params_w"]))
+                gt_head = gt_w_j3d_for_head[:, :, head_joint_id]
+            else:
+                raise ValueError(f"Unknown ego_head_loss_target={head_loss_target}")
+            head_mask = mask
+            if "head_valid" in ego_cond:
+                head_mask = head_mask & ego_cond["head_valid"]
+            head_loss = F.l1_loss(pred_head, gt_head, reduction="none")
+            head_loss = safe_masked_mean(head_loss, head_mask[..., None])
+            extra_loss += head_loss * ego_head_weight
+            extra_loss_dict["ego_head_trans_loss"] = head_loss
+
+    if weights.static_conf_bce > 0 and static_conf_logits_ego is not None:
         vel_thr = args.static_conf.vel_thr
         assert vel_thr > 0
         joint_ids = [7, 10, 8, 11, 20, 21]
-        gt_w_j3d = endecoder.fk_v2(**inputs["smpl_params_w"])
+        gt_w_j3d = endecoder.fk_v2(**_body_smpl_params(ego_targets["smpl_params_w"]))
         static_gt = get_static_joint_mask(gt_w_j3d, vel_thr=vel_thr, repeat_last=True)
         static_gt = static_gt[:, :, joint_ids].float()
 
@@ -336,12 +824,12 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
 
     # Incam FK
     # prediction
-    pred_c_j3d = endecoder.fk_v2(**pred_smpl_params)
+    pred_c_j3d = endecoder.fk_v2(**_body_smpl_params(pred_smpl_params))
     pred_cr_j3d = pred_c_j3d - pred_c_j3d[:, :, :1]  # (B, L, J, 3)
     if torch.isnan(pred_c_j3d).any() or torch.isinf(pred_c_j3d).any():
         Log.warning("NaN/Inf in pred_c_j3d!")
     # gt
-    gt_c_j3d = endecoder.fk_v2(**inputs["interactee_smpl_params_c"])  # (B, L, J, 3)
+    gt_c_j3d = endecoder.fk_v2(**_body_smpl_params(inputs["interactee_smpl_params_c"]))  # (B, L, J, 3)
     gt_cr_j3d = gt_c_j3d - gt_c_j3d[:, :, :1]  # (B, L, J, 3)
 
     # Root aligned C-MPJPE Loss
@@ -410,7 +898,7 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
 
     if weights.cr_verts > 0:
         # SMPL forward
-        pred_c_verts437, pred_c_j17 = endecoder.smplx_model(**pred_smpl_params)
+        pred_c_verts437, pred_c_j17 = endecoder.smplx_model(**_body_smpl_params(pred_smpl_params))
         root_ = pred_c_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
         pred_cr_verts437 = pred_c_verts437 - root_
 
@@ -467,11 +955,20 @@ def compute_extra_global_loss(inputs, outputs, ppl):
     static_conf_logits = model_output["static_conf_logits"]
 
     if weights.transl_w > 0:
-        # compute pred_transl_w by rollout
         gt_transl_w = inputs["interactee_smpl_params_w"]["transl"]
-        gt_global_orient_w = inputs["interactee_smpl_params_w"]["global_orient"]
-        local_transl_vel = decode_dict["local_transl_vel"]
-        pred_transl_w = rollout_local_transl_vel(local_transl_vel, gt_global_orient_w, gt_transl_w[:, [0]])
+        loss_mode = args.get("exo_world_loss_mode", "rollout_gt_init")
+        if loss_mode == "incam_kinect":
+            if "pred_smpl_params_kinect_from_incam" not in outputs:
+                outputs["pred_smpl_params_kinect_from_incam"] = _smpl_params_incam_to_input_world(
+                    outputs["pred_smpl_params_incam"], inputs
+                )
+            pred_transl_w = outputs["pred_smpl_params_kinect_from_incam"]["transl"]
+        elif loss_mode == "rollout_gt_init":
+            gt_global_orient_w = inputs["interactee_smpl_params_w"]["global_orient"]
+            local_transl_vel = decode_dict["local_transl_vel"]
+            pred_transl_w = rollout_local_transl_vel(local_transl_vel, gt_global_orient_w, gt_transl_w[:, [0]])
+        else:
+            raise ValueError(f"Unknown exo_world_loss_mode={loss_mode}")
 
         trans_w_loss = F.l1_loss(pred_transl_w, gt_transl_w, reduction="none")
         trans_w_loss = safe_masked_mean(trans_w_loss, mask[..., None])
@@ -484,7 +981,7 @@ def compute_extra_global_loss(inputs, outputs, ppl):
         vel_thr = args.static_conf.vel_thr
         assert vel_thr > 0
         joint_ids = [7, 10, 8, 11, 20, 21]  # [L_Ankle, L_foot, R_Ankle, R_foot, L_wrist, R_wrist]
-        gt_w_j3d = endecoder.fk_v2(**inputs["interactee_smpl_params_w"])  # (B, L, J=22, 3)
+        gt_w_j3d = endecoder.fk_v2(**_body_smpl_params(inputs["interactee_smpl_params_w"]))  # (B, L, J=22, 3)
         static_gt = get_static_joint_mask(gt_w_j3d, vel_thr=vel_thr, repeat_last=True)  # (B, L, J)
         static_gt = static_gt[:, :, joint_ids].float()  # (B, L, J')
         pred_static_conf_logits = static_conf_logits

@@ -91,6 +91,9 @@ class PycolmapRansacTwoViewGeometrySolver:
         return self.camera_matrix
 
     def solve(self, pts0, pts1):
+        if len(pts0) < 8 or len(pts1) < 8:
+            print(f"[TwoViewGeometry] Too few matches ({len(pts0)}); using identity delta.")
+            return np.eye(4, dtype=np.float32)
         matches = np.stack([np.arange(len(pts0)), np.arange(len(pts0))], axis=-1)
         answer = pycolmap.estimate_calibrated_two_view_geometry(
             self.camera,
@@ -102,8 +105,11 @@ class PycolmapRansacTwoViewGeometrySolver:
         )
 
         # cam2_from_cam1 means T_0_to_1 in our language
+        if answer is None or answer.cam2_from_cam1 is None:
+            print("[TwoViewGeometry] Relative pose estimation failed; using identity delta.")
+            return np.eye(4, dtype=np.float32)
         Rt = answer.cam2_from_cam1.matrix().astype(np.float32)  # shape (3, 4)
-        T = np.eye(4)
+        T = np.eye(4, dtype=np.float32)
         T[:3] = Rt
         return T
 

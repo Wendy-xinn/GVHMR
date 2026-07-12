@@ -177,3 +177,6 @@ tensorboard
 
 # glove
 glove
+
+data/
+outputs/

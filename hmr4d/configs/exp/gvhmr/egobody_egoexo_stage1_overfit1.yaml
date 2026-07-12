@@ -1,0 +1,92 @@
+# @package _global_
+defaults:
+  - override /data: egobody/egoexo_v1
+  - override /model: gvhmr/gvhmr_pl
+  - override /endecoder: gvhmr/v1_amass_local_bedlam_cam
+  - override /optimizer: adamw_2e-4
+  - override /scheduler_cfg: epoch_half_200_350
+  - override /network: gvhmr/relative_transformer
+  - override /callbacks:
+      - prog_bar/prog_reporter_every0.1
+      - train_speed_timer/base
+      - lr_monitor/pl
+  - _self_
+
+exp_name: egobody_egoexo_stage1_overfit1
+data_name: egobody_egoexo_v1_overfit1
+
+network:
+  ego_output_dim: 145
+
+model:
+  freeze_backbone: true
+  freeze_exo_head: true
+  freeze_ego_head: false
+  copy_exo_to_ego: false
+  backbone_lr_scale: 0.05
+  unfreeze_last_n_blocks: 4
+  vis_every_n_steps: 20
+  val_vis_every_n_batches: 1
+
+pipeline:
+  _target_: hmr4d.model.gvhmr.pipeline.gvhmr_pipeline.Pipeline
+  args_denoiser3d: ${network}
+  args:
+    endecoder_opt: ${endecoder}
+    normalize_cam_angvel: true
+    branch_mode: ego
+    freeze_exo_head: true
+    ego_head_type: cpf
+    enable_frozen_ego_image_exo: true
+    weights:
+      cr_j3d: 500.
+      transl_c: 0.
+      cr_verts: 500.
+      j2d: 0.
+      verts2d: 0.
+      transl_w: 1.
+      static_conf_bce: 1.
+      ego_head_trans: 50.
+    static_conf:
+      vel_thr: 0.15
+    ego_head_joint_id: 15
+    ego_head_loss_target: smpl_head_gt
+
+data:
+  dataset_opts:
+    train:
+      egobody_egoexo_train:
+        split: train
+        motion_frames: 128
+        overfit_single_sample: true
+        require_features: true
+    val:
+      egobody_egoexo_val:
+        split: train
+        motion_frames: 128
+        overfit_single_sample: true
+        require_features: true
+  loader_opts:
+    train:
+      batch_size: 1
+      num_workers: 0
+    val:
+      batch_size: 1
+      num_workers: 0
+
+pl_trainer:
+  precision: 16-mixed
+  log_every_n_steps: 1
+  gradient_clip_val: 0.5
+  max_epochs: 10000
+  max_steps: 1000
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 20
+  limit_val_batches: 1
+  devices: 1
+
+logger:
+  _target_: pytorch_lightning.loggers.TensorBoardLogger
+  save_dir: ${output_dir}
+  name: tb
+  version: ${now:%m%d_%H%M%S}

@@ -3,6 +3,7 @@ import torch
 import pytorch_lightning as pl
 import numpy as np
 import argparse
+from omegaconf import open_dict
 from hmr4d.utils.pylogger import Log
 import hydra
 from hydra import initialize_config_module, compose
@@ -51,6 +52,14 @@ def parse_args_to_cfg():
         "For iPhone 15p, the [0.5x, 1x, 2x, 3x] lens have typical values [13, 24, 48, 77]."
         "If the camera zoom in a lot, you can try 135, 200 or even larger values.",
     )
+    parser.add_argument(
+        "--K_fullimg_npy",
+        type=str,
+        default=None,
+        help="Optional .npy file containing per-frame full-image camera intrinsics with shape (L, 3, 3).",
+    )
+    parser.add_argument("--force", action="store_true", help="Recompute prediction/render outputs even if cached files exist.")
+    parser.add_argument("--no_render", action="store_true", help="Skip incam/global video rendering and only save hmr4d_results.pt.")
     parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
     args = parser.parse_args()
 
@@ -67,15 +76,20 @@ def parse_args_to_cfg():
             f"static_cam={args.static_cam}",
             f"verbose={args.verbose}",
             f"use_dpvo={args.use_dpvo}",
+            f"force={args.force}",
         ]
         if args.f_mm is not None:
             overrides.append(f"f_mm={args.f_mm}")
+        if args.K_fullimg_npy is not None:
+            overrides.append(f"K_fullimg_npy={str(Path(args.K_fullimg_npy).resolve())}")
 
         # Allow to change output root
         if args.output_root is not None:
             overrides.append(f"output_root={args.output_root}")
         register_store_gvhmr()
         cfg = compose(config_name="demo", overrides=overrides)
+    with open_dict(cfg):
+        cfg.no_render = args.no_render
 
     # Output
     Log.info(f"[Output Dir]: {cfg.output_dir}")
@@ -184,7 +198,14 @@ def load_data_dict(cfg):
             R_w2c = quaternion_to_matrix(traj_quat).mT
         else:  # SimpleVO
             R_w2c = torch.from_numpy(traj[:, :3, :3])
-    if cfg.f_mm is not None:
+    if cfg.K_fullimg_npy is not None:
+        K_fullimg = torch.from_numpy(np.load(cfg.K_fullimg_npy)).float()
+        if K_fullimg.shape != (length, 3, 3):
+            raise ValueError(
+                f"K_fullimg_npy must have shape ({length}, 3, 3), got {tuple(K_fullimg.shape)} from {cfg.K_fullimg_npy}"
+            )
+        Log.info(f"[K_fullimg] Loaded per-frame intrinsics from {cfg.K_fullimg_npy}")
+    elif cfg.f_mm is not None:
         K_fullimg = create_camera_sensor(width, height, cfg.f_mm)[2].repeat(length, 1, 1)
     else:
         K_fullimg = estimate_K(width, height).repeat(length, 1, 1)
@@ -202,7 +223,7 @@ def load_data_dict(cfg):
 
 def render_incam(cfg):
     incam_video_path = Path(cfg.paths.incam_video)
-    if incam_video_path.exists():
+    if incam_video_path.exists() and not cfg.force:
         Log.info(f"[Render Incam] Video already exists at {incam_video_path}")
         return
 
@@ -244,7 +265,7 @@ def render_incam(cfg):
 
 def render_global(cfg):
     global_video_path = Path(cfg.paths.global_video)
-    if global_video_path.exists():
+    if global_video_path.exists() and not cfg.force:
         Log.info(f"[Render Global] Video already exists at {global_video_path}")
         return
 
@@ -314,6 +335,12 @@ if __name__ == "__main__":
     data = load_data_dict(cfg)
 
     # ===== HMR4D ===== #
+    if cfg.force:
+        for output_path in [paths.hmr4d_results, paths.incam_video, paths.global_video, paths.incam_global_horiz_video]:
+            output_path = Path(output_path)
+            if output_path.exists():
+                output_path.unlink()
+
     if not Path(paths.hmr4d_results).exists():
         Log.info("[HMR4D] Predicting")
         model: DemoPL = hydra.utils.instantiate(cfg.model, _recursive_=False)
@@ -327,8 +354,11 @@ if __name__ == "__main__":
         torch.save(pred, paths.hmr4d_results)
 
     # ===== Render ===== #
-    render_incam(cfg)
-    render_global(cfg)
-    if not Path(paths.incam_global_horiz_video).exists():
-        Log.info("[Merge Videos]")
-        merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+    if cfg.no_render:
+        Log.info("[Render] Skipped by --no_render")
+    else:
+        render_incam(cfg)
+        render_global(cfg)
+        if not Path(paths.incam_global_horiz_video).exists():
+            Log.info("[Merge Videos]")
+            merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)

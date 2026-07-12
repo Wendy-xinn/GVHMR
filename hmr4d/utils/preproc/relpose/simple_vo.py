@@ -47,8 +47,12 @@ class SimpleVO:
             curr_frame = frames[frame_idx]
 
             # Match frames
-            pts0, pts1 = matcher.match_np(prev_frame, curr_frame)
-            T_delta = solver.solve(pts0, pts1)  # T_delta = T_curr @ T_last^-1
+            try:
+                pts0, pts1 = matcher.match_np(prev_frame, curr_frame)
+                T_delta = solver.solve(pts0, pts1)  # T_delta = T_curr @ T_last^-1
+            except Exception as exc:
+                print(f"[SimpleVO] VO failed at sampled frame {frame_idx}: {type(exc).__name__}: {exc}. Using identity delta.")
+                T_delta = np.eye(4, dtype=np.float32)
 
             # Compute current frame's transformation matrix
             T_w2c_list.append(T_delta @ T_w2c_list[-1])

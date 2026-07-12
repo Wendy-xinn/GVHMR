@@ -6,7 +6,8 @@ import hmr4d.dataset.threedpw.threedpw_motion_test
 import hmr4d.dataset.threedpw.threedpw_motion_train
 import hmr4d.dataset.bedlam.bedlam
 import hmr4d.dataset.h36m.h36m
-import hmr4d.dataset.egobody.egobody_view3
+# import hmr4d.dataset.egobody.egobody_view3
+import hmr4d.dataset.egobody.egobody_egoexo_v1
 
 # Trainer: Model Optimizer Loss
 import hmr4d.model.gvhmr.gvhmr_pl
