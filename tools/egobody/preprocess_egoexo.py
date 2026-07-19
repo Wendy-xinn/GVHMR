@@ -417,6 +417,24 @@ def _compute_joints_verts_and_bbx(params_kinect: dict[str, torch.Tensor], K: tor
     return torch.cat(verts_all), torch.cat(joints_all), torch.cat(bbx_all)
 
 
+def _camera_local_trans_vel(T_world_cam: torch.Tensor) -> torch.Tensor:
+    T = T_world_cam.float()
+    R = T[:, :3, :3]
+    t = T[:, :3, 3]
+    if t.shape[0] <= 1:
+        vel_w = torch.zeros_like(t)
+    else:
+        vel_w = torch.cat([t[1:] - t[:-1], t[-1:] - t[-2:-1]], dim=0)
+    return torch.einsum("lij,li->lj", R, vel_w)
+
+
+def _gravity_dir_in_cam(T_world_cam: torch.Tensor, up: bool = True) -> torch.Tensor:
+    T = T_world_cam.float()
+    R = T[:, :3, :3]
+    g = torch.tensor([0.0, 1.0 if up else -1.0, 0.0], dtype=T.dtype, device=T.device).expand(T.shape[0], 3)
+    return torch.einsum("lij,li->lj", R, g)
+
+
 def _compute_ego_pv_bbx(
     verts_kinect: torch.Tensor,
     joints_kinect: torch.Tensor,
@@ -529,6 +547,11 @@ def _update_cpf_only(args: argparse.Namespace) -> Path:
     traj["T_holo_cpf"] = T_holo_cpf
     traj["T_head_cpf"] = T_head_cpf_t
     traj["head_angvel"] = _relative_rot6d(T_holo_head)
+    if "T_holo_pv" in traj:
+        traj["T_pv_holo"] = torch.linalg.inv(traj["T_holo_pv"].float())
+        traj["pv_cam_angvel"] = compute_cam_angvel(traj["T_pv_holo"][:, :3, :3])
+        traj["pv_cam_trans_vel"] = _camera_local_trans_vel(traj["T_holo_pv"].float())
+        traj["pv_gravity_dir_cam"] = _gravity_dir_in_cam(traj["T_holo_pv"].float(), up=True)
     traj["head_valid"] = torch.tensor(head_data["head_valid"][head_idx], dtype=torch.bool)
     traj["gaze_origin_holo"] = torch.tensor(gaze_origin, dtype=torch.float32)
     traj["gaze_valid"] = torch.tensor(gaze_valid, dtype=torch.bool)
@@ -818,6 +841,8 @@ def preprocess_recording(args: argparse.Namespace) -> Path:
         "T_head_cpf": T_head_cpf_t,
         "head_angvel": _relative_rot6d(T_holo_head),
         "pv_cam_angvel": compute_cam_angvel(T_pv_holo[:, :3, :3]),
+        "pv_cam_trans_vel": _camera_local_trans_vel(T_holo_pv),
+        "pv_gravity_dir_cam": _gravity_dir_in_cam(T_holo_pv, up=True),
         "gaze_origin_holo": torch.tensor(gaze_origin, dtype=torch.float32),
         "gaze_direction_holo": torch.tensor(gaze_direction, dtype=torch.float32),
         "gaze_distance": torch.tensor(gaze_distance, dtype=torch.float32),

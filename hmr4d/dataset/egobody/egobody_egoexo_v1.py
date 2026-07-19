@@ -10,6 +10,7 @@ from hmr4d.dataset.imgfeat_motion.base_dataset import ImgfeatMotionDatasetBase
 from hmr4d.utils.geo.hmr_global import get_R_c2gv
 from hmr4d.utils.net_utils import get_valid_mask, repeat_to_max_len
 from hmr4d.utils.pylogger import Log
+from hmr4d.utils.geo_transform import compute_cam_angvel
 
 
 def _repeat_nested(data, max_len: int):
@@ -92,6 +93,25 @@ def _transform_smpl_world(smpl_params_w, T_raw_to_train):
 
 def _transform_T_world(T_world_obj, T_raw_to_train):
     return T_raw_to_train.to(T_world_obj.dtype) @ T_world_obj
+
+
+def _camera_local_trans_vel(T_world_cam):
+    T = T_world_cam.float()
+    R = T[:, :3, :3]
+    t = T[:, :3, 3]
+    if t.shape[0] <= 1:
+        vel_w = torch.zeros_like(t)
+    else:
+        vel_w = torch.cat([t[1:] - t[:-1], t[-1:] - t[-2:-1]], dim=0)
+    return torch.einsum('lij,li->lj', R, vel_w)
+
+
+def _gravity_dir_in_cam(T_world_cam, up=True):
+    T = T_world_cam.float()
+    R = T[:, :3, :3]
+    g = torch.tensor([0.0, 1.0 if up else -1.0, 0.0], dtype=T.dtype, device=T.device)
+    g = g.expand(T.shape[0], 3)
+    return torch.einsum('lij,li->lj', R, g)
 
 
 class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
@@ -228,18 +248,27 @@ class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
         T_world_head_raw = T_holo_to_world_raw @ T_holo_head
         T_world_cpf_raw = T_holo_to_world_raw @ T_holo_cpf
         T_world_pv_raw = T_holo_to_world_raw @ T_holo_pv
+        T_world_pv = _transform_T_world(T_world_pv_raw, T_raw_to_train)
+        # Recompute from the gravity-aligned T_world_pv so training never depends
+        # on stale cached trajectory fields or a different world-frame convention.
+        pv_cam_angvel = compute_cam_angvel(T_world_pv[:, :3, :3].mT)
+        pv_cam_trans_vel = _camera_local_trans_vel(T_world_pv)
+        pv_gravity_dir_cam = _gravity_dir_in_cam(T_world_pv, up=True)
         ego_cond = {
             'T_holo_head': T_holo_head,
             'T_holo_cpf': T_holo_cpf,
             'T_holo_pv': T_holo_pv,
             'T_world_head': _transform_T_world(T_world_head_raw, T_raw_to_train),
             'T_world_cpf': _transform_T_world(T_world_cpf_raw, T_raw_to_train),
-            'T_world_pv': _transform_T_world(T_world_pv_raw, T_raw_to_train),
+            'T_world_pv': T_world_pv,
             'T_world_head_raw': T_world_head_raw,
             'T_world_cpf_raw': T_world_cpf_raw,
             'T_world_pv_raw': T_world_pv_raw,
             'T_raw_to_train_world': T_raw_to_train.float().unsqueeze(0).repeat(end - start, 1, 1),
             'head_angvel': traj['head_angvel'][sl].float(),
+            'pv_cam_angvel': pv_cam_angvel.float(),
+            'pv_cam_trans_vel': pv_cam_trans_vel.float(),
+            'pv_gravity_dir_cam': pv_gravity_dir_cam.float(),
             'head_valid': traj['head_valid'][sl].bool(),
             'gaze_valid': traj['gaze_valid'][sl].bool(),
             'left_hand_summary_holo': traj['left_hand_summary_holo'][sl].float(),

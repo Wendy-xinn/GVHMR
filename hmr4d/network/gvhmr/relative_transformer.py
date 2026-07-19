@@ -21,10 +21,15 @@ class NetworkEncoderRoPE(nn.Module):
         # condition
         cliffcam_dim=3,
         cam_angvel_dim=6,
+        cam_trans_vel_dim=0,
+        gravity_dim=0,
         imgseq_dim=1024,
         ego_imgseq_dim=1024,
         ego_head_dim=25,
         ego_hand_dim=18,
+        interaction_dim=0,
+        cross_view_fusion=False,
+        cross_view_heads=4,
         # intermediate
         latent_dim=512,
         num_layers=12,
@@ -49,10 +54,15 @@ class NetworkEncoderRoPE(nn.Module):
         # condition
         self.cliffcam_dim = cliffcam_dim
         self.cam_angvel_dim = cam_angvel_dim
+        self.cam_trans_vel_dim = cam_trans_vel_dim
+        self.gravity_dim = gravity_dim
         self.imgseq_dim = imgseq_dim
         self.ego_imgseq_dim = ego_imgseq_dim
         self.ego_head_dim = ego_head_dim
         self.ego_hand_dim = ego_hand_dim
+        self.interaction_dim = interaction_dim
+        self.cross_view_fusion = cross_view_fusion
+        self.cross_view_heads = cross_view_heads
 
         # intermediate
         self.latent_dim = latent_dim
@@ -104,6 +114,17 @@ class NetworkEncoderRoPE(nn.Module):
             if self.static_conf_head:
                 self.static_conf_head_ego = Mlp(self.latent_dim, out_features=static_conf_dim)
 
+        if self.cross_view_fusion:
+            self.cross_q_norm = nn.LayerNorm(self.latent_dim)
+            self.cross_kv_norm = nn.LayerNorm(self.latent_dim)
+            self.cross_attn = nn.MultiheadAttention(
+                self.latent_dim,
+                num_heads=self.cross_view_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.cross_gate = nn.Parameter(torch.zeros(()))
+
 
     def _build_condition_embedder(self):
         latent_dim = self.latent_dim
@@ -117,6 +138,20 @@ class NetworkEncoderRoPE(nn.Module):
         if self.cam_angvel_dim > 0:
             self.cam_angvel_embedder = nn.Sequential(
                 nn.Linear(self.cam_angvel_dim, latent_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                zero_module(nn.Linear(latent_dim, latent_dim)),
+            )
+        if self.cam_trans_vel_dim > 0:
+            self.cam_trans_vel_embedder = nn.Sequential(
+                nn.Linear(self.cam_trans_vel_dim, latent_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                zero_module(nn.Linear(latent_dim, latent_dim)),
+            )
+        if self.gravity_dim > 0:
+            self.gravity_embedder = nn.Sequential(
+                nn.Linear(self.gravity_dim, latent_dim),
                 nn.SiLU(),
                 nn.Dropout(dropout),
                 zero_module(nn.Linear(latent_dim, latent_dim)),
@@ -147,6 +182,14 @@ class NetworkEncoderRoPE(nn.Module):
                 nn.Dropout(dropout),
                 zero_module(nn.Linear(latent_dim, latent_dim)),
             )
+        if self.interaction_dim > 0:
+            self.interaction_embedder = nn.Sequential(
+                nn.LayerNorm(self.interaction_dim),
+                nn.Linear(self.interaction_dim, latent_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                zero_module(nn.Linear(latent_dim, latent_dim)),
+            )
 
     def forward(
         self,
@@ -154,10 +197,20 @@ class NetworkEncoderRoPE(nn.Module):
         obs=None,
         f_cliffcam=None,
         f_cam_angvel=None,
+        f_cam_trans_vel=None,
+        f_gravity_dir=None,
         f_imgseq=None,
         f_ego_imgseq=None,
         f_ego_head=None,
         f_ego_hand=None,
+        f_interaction=None,
+        cross_obs=None,
+        cross_f_cliffcam=None,
+        cross_f_cam_angvel=None,
+        cross_f_cam_trans_vel=None,
+        cross_f_gravity_dir=None,
+        cross_f_imgseq=None,
+        cross_f_ego_imgseq=None,
     ):
         """
         Args:
@@ -168,37 +221,81 @@ class NetworkEncoderRoPE(nn.Module):
             f_ego_imgseq: (B, L, C), ego PV image feature.
             f_ego_head: (B, L, C), compact CPF/head trajectory condition.
             f_ego_hand: (B, L, C), optional hand/gaze condition.
+            f_interaction: (B, L, C), optional ego-exo relative interaction condition.
             f_cliffcam: (B, L, 3), CLIFF-Cam parameters (bbx-detection in the full-image)
             f_noisyobs: (B, L, C), noisy pose observation
             f_cam_angvel: (B, L, 6), Camera angular velocity
+            f_cam_trans_vel: (B, L, 3), camera-local translation velocity.
+            f_gravity_dir: (B, L, 3), gravity/up direction in camera coordinates.
         """
         B, L, J, C = obs.shape
         assert J == 17 and C == 3
 
-        # Main token from observation (2D pose)
-        obs = obs.clone()
-        visible_mask = obs[..., [2]] > 0.5  # (B, L, J, 1)
-        obs[~visible_mask[..., 0]] = 0  # set low-conf to all zeros
-        f_obs = self.learned_pos_linear(obs[..., :2])  # (B, L, J, 32)
-        f_obs = f_obs * visible_mask + self.learned_pos_params.repeat(B, L, 1, 1) * ~visible_mask
-        x = self.embed_noisyobs(f_obs.view(B, L, -1))  # (B, L, J*32) -> (B, L, C)
+        def encode_stream(
+            obs_,
+            f_cliffcam_,
+            f_cam_angvel_,
+            f_cam_trans_vel_=None,
+            f_gravity_dir_=None,
+            f_imgseq_=None,
+            f_ego_imgseq_=None,
+            f_ego_head_=None,
+            f_ego_hand_=None,
+            f_interaction_=None,
+        ):
+            obs_ = obs_.clone()
+            visible_mask = obs_[..., [2]] > 0.5
+            obs_[~visible_mask[..., 0]] = 0
+            f_obs = self.learned_pos_linear(obs_[..., :2])
+            f_obs = f_obs * visible_mask + self.learned_pos_params.repeat(B, L, 1, 1) * ~visible_mask
+            x_ = self.embed_noisyobs(f_obs.view(B, L, -1))
 
-        # Condition
-        f_to_add = []
-        f_to_add.append(self.cliffcam_embedder(f_cliffcam))
-        if hasattr(self, "cam_angvel_embedder"):
-            f_to_add.append(self.cam_angvel_embedder(f_cam_angvel))
-        if f_imgseq is not None and hasattr(self, "imgseq_embedder"):
-            f_to_add.append(self.imgseq_embedder(f_imgseq))
-        if f_ego_imgseq is not None and hasattr(self, "ego_imgseq_embedder"):
-            f_to_add.append(self.ego_imgseq_embedder(f_ego_imgseq))
-        if f_ego_head is not None and hasattr(self, "ego_head_embedder"):
-            f_to_add.append(self.ego_head_embedder(f_ego_head))
-        if f_ego_hand is not None and hasattr(self, "ego_hand_embedder"):
-            f_to_add.append(self.ego_hand_embedder(f_ego_hand))
+            f_to_add_ = [self.cliffcam_embedder(f_cliffcam_)]
+            if hasattr(self, "cam_angvel_embedder"):
+                f_to_add_.append(self.cam_angvel_embedder(f_cam_angvel_))
+            if f_cam_trans_vel_ is not None and hasattr(self, "cam_trans_vel_embedder"):
+                f_to_add_.append(self.cam_trans_vel_embedder(f_cam_trans_vel_))
+            if f_gravity_dir_ is not None and hasattr(self, "gravity_embedder"):
+                f_to_add_.append(self.gravity_embedder(f_gravity_dir_))
+            if f_imgseq_ is not None and hasattr(self, "imgseq_embedder"):
+                f_to_add_.append(self.imgseq_embedder(f_imgseq_))
+            if f_ego_imgseq_ is not None and hasattr(self, "ego_imgseq_embedder"):
+                f_to_add_.append(self.ego_imgseq_embedder(f_ego_imgseq_))
+            if f_ego_head_ is not None and hasattr(self, "ego_head_embedder"):
+                f_to_add_.append(self.ego_head_embedder(f_ego_head_))
+            if f_ego_hand_ is not None and hasattr(self, "ego_hand_embedder"):
+                f_to_add_.append(self.ego_hand_embedder(f_ego_hand_))
+            if f_interaction_ is not None and hasattr(self, "interaction_embedder"):
+                f_to_add_.append(self.interaction_embedder(f_interaction_))
 
-        for f_delta in f_to_add:
-            x = x + f_delta
+            for f_delta in f_to_add_:
+                x_ = x_ + f_delta
+            return x_
+
+        x = encode_stream(
+            obs,
+            f_cliffcam,
+            f_cam_angvel,
+            f_cam_trans_vel,
+            f_gravity_dir,
+            f_imgseq,
+            f_ego_imgseq,
+            f_ego_head,
+            f_ego_hand,
+            f_interaction,
+        )
+
+        x_cross = None
+        if self.cross_view_fusion and cross_obs is not None:
+            x_cross = encode_stream(
+                cross_obs,
+                cross_f_cliffcam if cross_f_cliffcam is not None else f_cliffcam,
+                cross_f_cam_angvel if cross_f_cam_angvel is not None else f_cam_angvel,
+                cross_f_cam_trans_vel,
+                cross_f_gravity_dir,
+                cross_f_imgseq,
+                cross_f_ego_imgseq,
+            )
 
         # Setup length and make padding mask
         assert B == length.size(0)
@@ -216,8 +313,23 @@ class NetworkEncoderRoPE(nn.Module):
             attnmask = None
 
         # Transformer
-        for block in self.blocks:
-            x = block(x, attn_mask=attnmask, tgt_key_padding_mask=pmask)
+        if x_cross is not None:
+            x_cat = torch.cat([x, x_cross], dim=0)
+            pmask_cat = torch.cat([pmask, pmask], dim=0)
+            for block in self.blocks:
+                x_cat = block(x_cat, attn_mask=attnmask, tgt_key_padding_mask=pmask_cat)
+            x, x_cross = x_cat[:B], x_cat[B:]
+            cross_delta, _ = self.cross_attn(
+                self.cross_q_norm(x),
+                self.cross_kv_norm(x_cross),
+                self.cross_kv_norm(x_cross),
+                key_padding_mask=pmask,
+                need_weights=False,
+            )
+            x = x + self.cross_gate * cross_delta
+        else:
+            for block in self.blocks:
+                x = block(x, attn_mask=attnmask, tgt_key_padding_mask=pmask)
 
         # Output
         sample = self.final_layer(x)  # (B, L, C)

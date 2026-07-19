@@ -6,15 +6,27 @@ set -euo pipefail
 #   Stage 2: ego+exo joint training on the same preprocessed EgoBody paired data, starting from Stage 1 ckpt.
 #
 # Useful overrides:
-#   DATA_ROOT=/public/home/wenxin/GVHMR/data
+#   DATA_ROOT=/public/home/wenxin/GVHMR_ifcam/data
 #   DEVICES=1
 #   STAGE1_EPOCHS=80 STAGE2_EPOCHS=80
 #   UNFREEZE_BLOCKS=2 STAGE1_BACKBONE_LR_SCALE=0.02 STAGE2_BACKBONE_LR_SCALE=0.005
 #   STAGE1_INIT_CKPT=/path/to/stage1.ckpt   # optional; also accepts ckpt_path=... for stage 1 only
 
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
 PYTHON_BIN=${PYTHON_BIN:-/public/home/wenxin/miniconda3/envs/gvhmr/bin/python}
-DATA_ROOT=${DATA_ROOT:-/public/home/wenxin/GVHMR/data}
-DATA_NAME=${DATA_NAME:-egobody_egoexo_v2}
+DEFAULT_DATA_ROOT="${REPO_ROOT}/data"
+LEGACY_DATA_ROOT=/public/home/wenxin/GVHMR/data
+DATA_ROOT=${DATA_ROOT:-${DEFAULT_DATA_ROOT}}
+if [[ ! -d "${DATA_ROOT}" && "${DATA_ROOT}" == "${DEFAULT_DATA_ROOT}" && -d "${LEGACY_DATA_ROOT}" ]]; then
+  echo "DATA_ROOT ${DATA_ROOT} not found; reading preprocessed data from ${LEGACY_DATA_ROOT}"
+  echo "Create ${DATA_ROOT} as a symlink or set DATA_ROOT=... if you want a different data location."
+  DATA_ROOT=${LEGACY_DATA_ROOT}
+fi
+OUTPUT_ROOT=${OUTPUT_ROOT:-${REPO_ROOT}/outputs}
+DATA_NAME=${DATA_NAME:-egobody_egoexo_ifcam}
 DEVICES=${DEVICES:-1}
 BATCH_SIZE=${BATCH_SIZE:-16}
 NUM_WORKERS=${NUM_WORKERS:-8}
@@ -39,8 +51,8 @@ done
 
 COMMON_OVERRIDES=(
   data_name=${DATA_NAME}
-  data.dataset_opts.train.egobody_egoexo_train.output_root=${DATA_ROOT}
-  data.dataset_opts.val.egobody_egoexo_val.output_root=${DATA_ROOT}
+  +data.dataset_opts.train.egobody_egoexo_train.output_root=${DATA_ROOT}
+  +data.dataset_opts.val.egobody_egoexo_val.output_root=${DATA_ROOT}
   data.loader_opts.train.batch_size=${BATCH_SIZE}
   data.loader_opts.val.batch_size=1
   data.loader_opts.train.num_workers=${NUM_WORKERS}
@@ -60,10 +72,24 @@ if [[ -n "${STAGE1_INIT_CKPT}" ]]; then
   echo "Stage 1 init checkpoint: ${STAGE1_INIT_CKPT}"
 fi
 
-echo "========== Stage 1: Ego input, ego-supervised =========="
-${PYTHON_BIN} tools/train.py   exp=gvhmr/egobody_egoexo_stage1   exp_name=egobody_egoexo_stage1_ego_only_long   pipeline.args.branch_mode=both   pipeline.args.input_role=ego   pipeline.args.train_input_role=ego   pipeline.args.supervise_role=ego   pipeline.args.enable_frozen_ego_image_exo=false   model.freeze_backbone=true   model.freeze_exo_head=true   model.freeze_ego_head=false   model.backbone_lr_scale=${STAGE1_BACKBONE_LR_SCALE}   pl_trainer.max_epochs=${STAGE1_EPOCHS}   "${STAGE1_CKPT_OVERRIDE[@]}"   "${COMMON_OVERRIDES[@]}"   "${USER_OVERRIDES[@]}"
+STAGE1_EXP_NAME=egobody_egoexo_stage1_ego_only_ifcam_loco
+STAGE2_EXP_NAME=egobody_egoexo_stage2_both_ifcam_loco
+STAGE1_OUTPUT_DIR="${OUTPUT_ROOT}/${DATA_NAME}/${STAGE1_EXP_NAME}"
+STAGE2_OUTPUT_DIR="${OUTPUT_ROOT}/${DATA_NAME}/${STAGE2_EXP_NAME}"
+mkdir -p "${OUTPUT_ROOT}/${DATA_NAME}"
 
-STAGE1_CKPT_DIR="outputs/${DATA_NAME}/egobody_egoexo_stage1_ego_only_long/checkpoints"
+echo "Repo root: ${REPO_ROOT}"
+echo "Data root: ${DATA_ROOT}"
+echo "Output root: ${OUTPUT_ROOT}"
+${PYTHON_BIN} - <<'PYIMPORT'
+import hmr4d
+print(f"hmr4d import: {hmr4d.__file__}")
+assert hmr4d.__file__.startswith("/public/home/wenxin/GVHMR_ifcam/"), hmr4d.__file__
+PYIMPORT
+echo "========== Stage 1: Ego input, ego-supervised =========="
+${PYTHON_BIN} tools/train.py   exp=gvhmr/egobody_egoexo_stage1   exp_name=${STAGE1_EXP_NAME}   output_dir=${STAGE1_OUTPUT_DIR}   pipeline.args.branch_mode=both   pipeline.args.input_role=ego   pipeline.args.train_input_role=ego   pipeline.args.supervise_role=ego   pipeline.args.enable_frozen_ego_image_exo=false   model.freeze_backbone=true   model.freeze_exo_head=true   model.freeze_ego_head=false   model.backbone_lr_scale=${STAGE1_BACKBONE_LR_SCALE}   pl_trainer.max_epochs=${STAGE1_EPOCHS}   "${STAGE1_CKPT_OVERRIDE[@]}"   "${COMMON_OVERRIDES[@]}"   "${USER_OVERRIDES[@]}"
+
+STAGE1_CKPT_DIR="${STAGE1_OUTPUT_DIR}/checkpoints"
 STAGE1_CKPT=$(find "${STAGE1_CKPT_DIR}" -maxdepth 1 -type f -name '*.ckpt' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 1 | cut -d' ' -f2- || true)
 if [[ -z "${STAGE1_CKPT}" ]]; then
   echo "ERROR: no Stage 1 checkpoint found in ${STAGE1_CKPT_DIR}" >&2
@@ -73,4 +99,4 @@ fi
 
 echo "Using Stage 1 checkpoint: ${STAGE1_CKPT}"
 echo "========== Stage 2: Ego+Exo joint on EgoBody paired data =========="
-${PYTHON_BIN} tools/train.py   exp=gvhmr/egobody_egoexo_stage2_both   exp_name=egobody_egoexo_stage2_both_long   ckpt_path="${STAGE1_CKPT}"   pipeline.args.branch_mode=both   model.freeze_backbone=true   model.freeze_exo_head=false   model.freeze_ego_head=false   model.backbone_lr_scale=${STAGE2_BACKBONE_LR_SCALE}   pl_trainer.max_epochs=${STAGE2_EPOCHS}   "${COMMON_OVERRIDES[@]}"   "${USER_OVERRIDES[@]}"
+${PYTHON_BIN} tools/train.py   exp=gvhmr/egobody_egoexo_stage2_both   exp_name=${STAGE2_EXP_NAME}   output_dir=${STAGE2_OUTPUT_DIR}   ckpt_path="${STAGE1_CKPT}"   pipeline.args.branch_mode=both   model.freeze_backbone=true   model.freeze_exo_head=false   model.freeze_ego_head=false   model.backbone_lr_scale=${STAGE2_BACKBONE_LR_SCALE}   pl_trainer.max_epochs=${STAGE2_EPOCHS}   "${COMMON_OVERRIDES[@]}"   "${USER_OVERRIDES[@]}"

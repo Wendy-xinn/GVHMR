@@ -17,13 +17,20 @@ exp_name: egobody_egoexo_stage1
 data_name: egobody_egoexo_v1
 
 network:
-  ego_output_dim: 145
+  ego_output_dim: 148
+  cam_trans_vel_dim: 3
+  gravity_dim: 3
+  interaction_dim: 10
+  cross_view_fusion: false
+  cross_view_heads: 4
 
 model:
   freeze_backbone: false
   freeze_exo_head: true
   freeze_ego_head: false
   copy_exo_to_ego: false
+  copy_exo_to_ego_after_load: false
+  copy_exo_to_ego_mode: pose
   backbone_lr_scale: 0.1
   vis_every_n_steps: 500
   val_vis_every_n_batches: 80
@@ -40,16 +47,29 @@ pipeline:
     supervise_role: ego
     freeze_exo_head: true
     ego_head_type: cpf
+    ego_motion_mode: cam_angvel_cpf
     enable_frozen_ego_image_exo: false
+    use_interaction_condition: true
+    use_cross_view_teacher: false
     weights:
-      cr_j3d: 500.
+      cr_j3d: 300.
       transl_c: 0.
-      cr_verts: 500.
+      cr_verts: 200.
       j2d: 0.
       verts2d: 0.
-      transl_w: 1.
-      static_conf_bce: 1.
+      transl_w: 0.05
+      static_conf_bce: 0.5
       ego_head_trans: 50.
+      ego_upper_j3d: 200.
+      ego_upper_limb: 100.
+      ego_first_transl_w: 20.
+      ego_local_transl_vel: 100.
+      ego_direct_vel_consistency: 20.
+      ego_floor: 0.5
+      ego_floor_penetration: 1.0
+      ego_foot_sliding: 50.0
+      ego_root_accel: 10.0
+      ego_pose_accel: 2.0
     static_conf:
       vel_thr: 0.15
     ego_head_joint_id: 15
