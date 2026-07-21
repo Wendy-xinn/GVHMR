@@ -20,7 +20,8 @@ set -euo pipefail
 #   SKIP_POSE=1 POSE_CKPT=/path/to/pose.ckpt bash scripts/train_egobody_ego_curriculum.sh
 #   REUSE_POSE_RUN=curriculum1 RUN_SUFFIX=residual_coarse2 SKIP_FINETUNE=1 bash scripts/train_egobody_ego_curriculum.sh
 #   REUSE_POSE_RUN=curriculum1 RUN_SUFFIX=exo_pose_init1 COPY_EXO_TO_EGO_AFTER_LOAD=true LOCO_UNFREEZE_BLOCKS=2 bash scripts/train_egobody_ego_curriculum.sh
-#   REUSE_POSE_RUN=curriculum1 RUN_SUFFIX=cross_attn_teacher1 USE_CROSS_VIEW_TEACHER=true COPY_EXO_TO_EGO_AFTER_LOAD=true LOCO_UNFREEZE_BLOCKS=2 bash scripts/train_egobody_ego_curriculum.sh
+#   Before USE_CROSS_VIEW_TEACHER=true, append exo wearer crop features once:
+#   PYTHONPATH=/public/home/wenxin/GVHMR_ifcam /public/home/wenxin/miniconda3/envs/gvhmr/bin/python tools/egobody/preprocess_egoexo.py --output-root /public/home/wenxin/GVHMR_ifcam/data --all --split-filter train --only-missing-exo-wearer-features --resume
 #   SKIP_LOCO=1 LOCO_CKPT=/path/to/loco.ckpt bash scripts/train_egobody_ego_curriculum.sh
 #   EXTRA_ARGS="model.val_vis_every_n_batches=80" bash scripts/train_egobody_ego_curriculum.sh
 
@@ -76,7 +77,12 @@ COPY_EXO_TO_EGO=${COPY_EXO_TO_EGO:-false}
 COPY_EXO_TO_EGO_AFTER_LOAD=${COPY_EXO_TO_EGO_AFTER_LOAD:-false}
 COPY_EXO_TO_EGO_MODE=${COPY_EXO_TO_EGO_MODE:-pose}
 USE_CROSS_VIEW_TEACHER=${USE_CROSS_VIEW_TEACHER:-false}
+USE_INTERACTION_CONDITION=${USE_INTERACTION_CONDITION:-false}
 CROSS_VIEW_HEADS=${CROSS_VIEW_HEADS:-4}
+SUPERVISE_ROLE=${SUPERVISE_ROLE:-ego}
+FREEZE_EXO_HEAD=${FREEZE_EXO_HEAD:-true}
+EXO_TOKEN_DROPOUT=${EXO_TOKEN_DROPOUT:-0.3}
+EXO_PERSON_DROPOUT=${EXO_PERSON_DROPOUT:-0.1}
 
 # Optional whitespace-separated Hydra overrides applied to all stages.
 # Example: EXTRA_ARGS="pl_trainer.limit_val_batches=8 model.val_vis_every_n_batches=20"
@@ -112,17 +118,21 @@ COMMON_OVERRIDES=(
   pipeline.args.branch_mode=both
   pipeline.args.input_role=ego
   pipeline.args.train_input_role=ego
-  pipeline.args.supervise_role=ego
+  pipeline.args.supervise_role=${SUPERVISE_ROLE}
   pipeline.args.enable_frozen_ego_image_exo=false
-  pipeline.args.use_interaction_condition=true
+  pipeline.args.use_interaction_condition=${USE_INTERACTION_CONDITION}
   pipeline.args.use_cross_view_teacher=${USE_CROSS_VIEW_TEACHER}
+  pipeline.args.freeze_exo_head=${FREEZE_EXO_HEAD}
+  pipeline.args.cross_view_exo_token_dropout=${EXO_TOKEN_DROPOUT}
+  pipeline.args.cross_view_exo_person_dropout=${EXO_PERSON_DROPOUT}
+  pipeline.args.loss_role_alias=wearer_partner
   network.cross_view_fusion=${USE_CROSS_VIEW_TEACHER}
   network.cross_view_heads=${CROSS_VIEW_HEADS}
 )
 
 POSE_OVERRIDES=(
   model.freeze_backbone=${POSE_FREEZE_BACKBONE}
-  model.freeze_exo_head=true
+  model.freeze_exo_head=${FREEZE_EXO_HEAD}
   model.freeze_ego_head=false
   model.unfreeze_last_n_blocks=${POSE_UNFREEZE_BLOCKS}
   model.backbone_lr_scale=${POSE_BACKBONE_LR_SCALE}
@@ -146,7 +156,7 @@ POSE_OVERRIDES=(
 
 LOCO_OVERRIDES=(
   model.freeze_backbone=${LOCO_FREEZE_BACKBONE}
-  model.freeze_exo_head=true
+  model.freeze_exo_head=${FREEZE_EXO_HEAD}
   model.freeze_ego_head=false
   model.unfreeze_last_n_blocks=${LOCO_UNFREEZE_BLOCKS}
   model.backbone_lr_scale=${LOCO_BACKBONE_LR_SCALE}
@@ -171,7 +181,7 @@ LOCO_OVERRIDES=(
 FT_OVERRIDES=(
   optimizer.lr=${FT_LR}
   model.freeze_backbone=${FT_FREEZE_BACKBONE}
-  model.freeze_exo_head=true
+  model.freeze_exo_head=${FREEZE_EXO_HEAD}
   model.freeze_ego_head=false
   model.unfreeze_last_n_blocks=${FT_UNFREEZE_BLOCKS}
   model.backbone_lr_scale=${FT_BACKBONE_LR_SCALE}

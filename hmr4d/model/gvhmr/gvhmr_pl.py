@@ -173,6 +173,14 @@ class GvhmrPL(pl.LightningModule):
             _freeze_module(getattr(den, "gravity_embedder", None), False)
             _freeze_module(getattr(den, "ego_head_embedder", None), False)
             _freeze_module(getattr(den, "ego_hand_embedder", None), False)
+            _freeze_module(getattr(den, "interaction_embedder", None), False)
+            _freeze_module(getattr(den, "cross_extrinsic_embedder", None), False)
+            _freeze_module(getattr(den, "cross_attn", None), False)
+            _freeze_module(getattr(den, "cross_q_norm", None), False)
+            _freeze_module(getattr(den, "cross_kv_norm", None), False)
+            _freeze_module(getattr(den, "cross_gate", None), False)
+            _freeze_module(getattr(den, "cross_interactee_type", None), False)
+            _freeze_module(getattr(den, "cross_wearer_type", None), False)
             n_unfreeze = int(unfreeze_last_n_blocks or 0)
             if n_unfreeze > 0:
                 blocks = getattr(den, "blocks", None)
@@ -203,24 +211,32 @@ class GvhmrPL(pl.LightningModule):
 
     def _default_loss_log_role(self, batch):
         role = batch.get("_supervise_role", None)
+        if role == "both" and self.pipeline.args.get("loss_role_alias", "ego_exo") == "wearer_partner":
+            return "teacher"
         if role not in ("ego", "exo"):
             role = batch.get("_input_role", self.pipeline.args.get("input_role", None))
         return role if role in ("ego", "exo") else "exo"
 
     def _loss_component_tag(self, key, default_role):
+        alias = self.pipeline.args.get("loss_role_alias", "ego_exo")
+        ego_role = "wearer" if alias == "wearer_partner" else "ego"
+        exo_role = "partner" if alias == "wearer_partner" else "exo"
         if key == "loss":
             return default_role, "loss"
         if key.endswith("_ego"):
-            return "ego", key[:-4]
+            return ego_role, key[:-4]
         if key.startswith("ego_"):
-            return "ego", key[4:]
-        return "exo", key
+            return ego_role, key[4:]
+        return exo_role, key
 
     def _log_loss_outputs(self, tag_prefix, outputs, log_kwargs, default_role):
         if "loss" in outputs:
             self.log(f"{tag_prefix}/loss", outputs["loss"], **log_kwargs)
             self.log(f"{tag_prefix}/{default_role}/loss", outputs["loss"], **log_kwargs)
         for k, v in outputs.items():
+            if k.startswith("cross_view_") and torch.is_tensor(v) and v.numel() == 1:
+                self.log(f"{tag_prefix}/cross_view/{k[len('cross_view_'):]}", v, **log_kwargs)
+                continue
             if "_loss" not in k:
                 continue
             role, name = self._loss_component_tag(k, default_role)
@@ -308,10 +324,11 @@ class GvhmrPL(pl.LightningModule):
         elif forced_input_role in ("ego", "exo"):
             input_role = forced_input_role
         if is_paired:
+            batch.setdefault("K_exo", batch["K_fullimg"])
             supervise_role = forced_supervise_role
-            if supervise_role not in ("ego", "exo"):
+            if supervise_role not in ("ego", "exo", "both"):
                 supervise_role = self.pipeline.args.get("supervise_role", None)
-            if supervise_role not in ("ego", "exo"):
+            if supervise_role not in ("ego", "exo", "both"):
                 supervise_role = input_role if branch_mode == "both" else branch_mode
             batch["_input_role"] = input_role
             batch["_supervise_role"] = supervise_role
@@ -337,6 +354,7 @@ class GvhmrPL(pl.LightningModule):
                 batch["bbx_xys"] = primary["bbx_xys"]
                 batch["kp2d"] = primary.get("kp2d", torch.zeros_like(primary["bbx_xys"][:, :, None].expand(-1, -1, 17, -1)))
                 batch["f_imgseq"] = primary["f_imgseq"]
+                batch["K_fullimg"] = batch.get("K_exo", batch["K_fullimg"])
                 if "exo_imgname" in batch:
                     batch["imgname"] = batch["exo_imgname"]
                 batch["mask"]["valid"] = batch["mask"].get("exo_valid", batch["mask"]["valid"])
@@ -957,6 +975,14 @@ class GvhmrPL(pl.LightningModule):
                     joints = self.pipeline.endecoder.fk_v2(**_body_smpl_params(flat)).reshape(F, -1, 3)
                 return joints.detach().float().cpu()
 
+        def _filter_finite_joints(joints):
+            if joints is None or joints.numel() == 0:
+                return None
+            finite = torch.isfinite(joints).all(dim=(-1, -2))
+            if not finite.any():
+                return None
+            return joints[finite]
+
         input_role = batch.get("_input_role", self._effective_branch_mode(batch))
         exo_pred_label = "exo_pred"
         items = [
@@ -966,6 +992,7 @@ class GvhmrPL(pl.LightningModule):
             (exo_pred_label, _joints_from_params(outputs.get("pred_smpl_params_kinect_from_incam")), "tab:purple"),
             ("exo_pred_aux", _joints_from_params(outputs.get("frozen_ego_image_exo_world_from_pv", outputs.get("frozen_ego_image_exo_kinect_from_incam"))), "tab:red"),
         ]
+        items = [(n, _filter_finite_joints(j), c) for n, j, c in items]
         items = [(n, j, c) for n, j, c in items if j is not None and j.numel() > 0]
         if not items:
             return
@@ -974,8 +1001,15 @@ class GvhmrPL(pl.LightningModule):
         skel = [(15, 12), (12, 9), (16, 13), (13, 9), (9, 6), (6, 3), (3, 0), (14, 11), (11, 8), (8, 5), (5, 2), (2, 0), (10, 7), (7, 4), (4, 1), (1, 0)]
         fig = plt.figure(figsize=(4 * len(frame_indices), 4), dpi=120)
         all_pts = torch.cat([j[min(int(fi), j.shape[0]-1)] for _, j, _ in items for fi in frame_indices], dim=0)
+        all_pts = all_pts[torch.isfinite(all_pts).all(dim=-1)]
+        if all_pts.numel() == 0:
+            plt.close(fig)
+            return
         center = all_pts.mean(0)
-        radius = (all_pts - center).abs().max().item() + 1e-4
+        radius = float((all_pts - center).abs().max()) + 1e-4
+        if not np.isfinite(radius):
+            plt.close(fig)
+            return
         for plot_i, frame_idx in enumerate(frame_indices, start=1):
             ax = fig.add_subplot(1, len(frame_indices), plot_i, projection="3d")
             for name, joints, color in items:
@@ -1368,16 +1402,37 @@ class GvhmrPL(pl.LightningModule):
                 t = t[None]
             return t[0].detach().float().cpu()
 
+        def _filter_finite_traj(traj):
+            if traj is None or traj.numel() == 0:
+                return None
+            if traj.shape[-1] != 3:
+                return None
+            traj = traj.reshape(-1, 3)
+            finite = torch.isfinite(traj).all(dim=-1)
+            if not finite.any():
+                return None
+            return traj[finite]
+
         world_coord = self._batch_world_coord_name(batch)
         curves = []
         cam_traj, cam_forward = self._camera_traj_from_batch(batch)
         cam_traj = self._to_gvhmr_vis_world(cam_traj, world_coord) if cam_traj is not None else None
         cam_forward = self._to_gvhmr_vis_world(cam_forward, world_coord) if cam_forward is not None else None
-        exo_gt = self._to_gvhmr_vis_world(_traj_from_params(outputs.get("exo_gt_smpl_params_w_aligned", batch.get("exo", {}).get("smpl_params_w", batch.get("interactee_smpl_params_w", batch.get("smpl_params_w"))))), world_coord)
-        ego_gt = self._to_gvhmr_vis_world(_traj_from_params(outputs.get("ego_gt_smpl_params_w_aligned", batch.get("ego", {}).get("smpl_params_w"))), world_coord)
-        ego_pred = self._to_gvhmr_vis_world(_traj_from_params(outputs.get("pred_smpl_params_global_ego")), world_coord)
-        exo_pred_incam = self._to_gvhmr_vis_world(_traj_from_params(outputs.get("pred_smpl_params_kinect_from_incam")), world_coord)
-        frozen = self._to_gvhmr_vis_world(_traj_from_params(outputs.get("frozen_ego_image_exo_world_from_pv", outputs.get("frozen_ego_image_exo_kinect_from_incam"))), world_coord)
+        if cam_traj is not None and cam_traj.numel() > 0:
+            cam_traj = cam_traj.reshape(-1, 3)
+            cam_finite = torch.isfinite(cam_traj).all(dim=-1)
+            if cam_forward is not None and cam_forward.shape[0] == cam_traj.shape[0]:
+                cam_forward = cam_forward.reshape(-1, 3)
+                cam_finite = cam_finite & torch.isfinite(cam_forward).all(dim=-1)
+                cam_forward = cam_forward[cam_finite] if cam_finite.any() else None
+            else:
+                cam_forward = None
+            cam_traj = cam_traj[cam_finite] if cam_finite.any() else None
+        exo_gt = _filter_finite_traj(self._to_gvhmr_vis_world(_traj_from_params(outputs.get("exo_gt_smpl_params_w_aligned", batch.get("exo", {}).get("smpl_params_w", batch.get("interactee_smpl_params_w", batch.get("smpl_params_w"))))), world_coord))
+        ego_gt = _filter_finite_traj(self._to_gvhmr_vis_world(_traj_from_params(outputs.get("ego_gt_smpl_params_w_aligned", batch.get("ego", {}).get("smpl_params_w"))), world_coord))
+        ego_pred = _filter_finite_traj(self._to_gvhmr_vis_world(_traj_from_params(outputs.get("pred_smpl_params_global_ego")), world_coord))
+        exo_pred_incam = _filter_finite_traj(self._to_gvhmr_vis_world(_traj_from_params(outputs.get("pred_smpl_params_kinect_from_incam")), world_coord))
+        frozen = _filter_finite_traj(self._to_gvhmr_vis_world(_traj_from_params(outputs.get("frozen_ego_image_exo_world_from_pv", outputs.get("frozen_ego_image_exo_kinect_from_incam"))), world_coord))
         input_role = batch.get("_input_role", self._effective_branch_mode(batch))
         exo_pred_label = "exo_pred"
         for name, traj, color in [
@@ -1398,8 +1453,15 @@ class GvhmrPL(pl.LightningModule):
         if cam_traj is not None and cam_traj.numel() > 0:
             extent_traj.append(cam_traj)
         all_traj = torch.cat(extent_traj, dim=0)
+        all_traj = all_traj[torch.isfinite(all_traj).all(dim=-1)]
+        if all_traj.numel() == 0:
+            plt.close(fig)
+            return
         center = all_traj.mean(0)
         radius = max(float((all_traj - center).abs().max()), 1.0)
+        if not np.isfinite(radius):
+            plt.close(fig)
+            return
         for name, traj, color in curves:
             # Match world_mesh_floor view: horizontal plane is x-z, vertical axis is y.
             ax.plot(traj[:, 0], traj[:, 2], traj[:, 1], color=color, label=name, linewidth=2)
@@ -1428,7 +1490,8 @@ class GvhmrPL(pl.LightningModule):
         if cam_traj is not None and cam_traj.numel() > 0:
             cam_y_min = float(cam_traj[:, 1].min()) - 0.2
             cam_y_max = float(cam_traj[:, 1].max()) + 0.2
-            ax.set_zlim(min(ax.get_zlim()[0], cam_y_min), max(ax.get_zlim()[1], cam_y_max))
+            if np.isfinite(cam_y_min) and np.isfinite(cam_y_max):
+                ax.set_zlim(min(ax.get_zlim()[0], cam_y_min), max(ax.get_zlim()[1], cam_y_max))
         ax.set_title("World root trajectories + input camera (x-z ground, y up)")
         self._add_tb_figure(f"{tag_prefix}/world_root_trajectories", fig, tag_prefix)
         plt.close(fig)
@@ -1460,9 +1523,10 @@ class GvhmrPL(pl.LightningModule):
             if cfg_input_role in ("ego", "exo"):
                 val_input_role = cfg_input_role
         val_supervise_role = self.pipeline.args.get("supervise_role", None)
-        if val_supervise_role not in ("ego", "exo"):
+        if val_supervise_role not in ("ego", "exo", "both"):
             val_supervise_role = val_input_role if branch_mode == "both" else branch_mode
         if is_paired:
+            batch.setdefault("K_exo", batch["K_fullimg"])
             batch["_input_role"] = val_input_role
             batch["_supervise_role"] = val_supervise_role
             if val_input_role == "ego":
@@ -1501,6 +1565,8 @@ class GvhmrPL(pl.LightningModule):
             "obs": obs,
             "bbx_xys": batch["bbx_xys"],
             "K_fullimg": batch["K_fullimg"],
+            "K_exo": batch.get("K_exo", batch["K_fullimg"]),
+            "K_ego": batch.get("K_ego", batch["K_fullimg"]),
             "cam_angvel": batch["cam_angvel"],
             "R_c2gv": batch["R_c2gv"],
             "f_imgseq": batch["f_imgseq"],
@@ -1742,6 +1808,7 @@ class GvhmrPL(pl.LightningModule):
         Log.info(f"[PL-Trainer] Loading ckpt: {ckpt_path}")
 
         state_dict = torch.load(ckpt_path, "cpu")["state_dict"]
+        has_ego_pose_head = any(k.startswith("pipeline.denoiser3d.final_layer_ego.") for k in state_dict)
         own_state = self.state_dict()
         skipped_shape = []
         filtered_state = {}
@@ -1764,7 +1831,10 @@ class GvhmrPL(pl.LightningModule):
         if len(unexpected) > 0:
             Log.warn(f"Unexpected keys: {unexpected}")
         if getattr(self, "copy_exo_to_ego_after_load", False):
-            self._copy_exo_to_ego(mode=getattr(self, "copy_exo_to_ego_mode", "pose"))
+            if has_ego_pose_head:
+                Log.info("[Init] Checkpoint already contains ego pose head; skip exo-to-ego copy")
+            else:
+                self._copy_exo_to_ego(mode=getattr(self, "copy_exo_to_ego_mode", "pose"))
 
 
 gvhmr_pl = builds(

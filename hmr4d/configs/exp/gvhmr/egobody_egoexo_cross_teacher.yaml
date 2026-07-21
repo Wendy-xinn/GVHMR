@@ -1,0 +1,125 @@
+# @package _global_
+# Cross-view two-person teacher: ego target queries exo wearer/partner source tokens.
+# Use with a pose warmup checkpoint via ckpt_path=...
+defaults:
+  - override /data: egobody/egoexo_v1
+  - override /model: gvhmr/gvhmr_pl
+  - override /endecoder: gvhmr/v1_amass_local_bedlam_cam
+  - override /optimizer: adamw_5e-5
+  - override /scheduler_cfg: epoch_half_200_350
+  - override /network: gvhmr/relative_transformer
+  - override /callbacks:
+      - simple_ckpt_saver/every1e
+      - prog_bar/prog_reporter_every0.1
+      - train_speed_timer/base
+      - lr_monitor/pl
+  - _self_
+
+exp_name: egobody_egoexo_cross_teacher
+data_name: egobody_egoexo_ifcam
+
+network:
+  ego_output_dim: 148
+  cam_trans_vel_dim: 3
+  gravity_dim: 3
+  cross_view_fusion: true
+  cross_view_heads: 8
+  cross_extrinsic_dim: 9
+  cross_local_radius: 4
+  cross_teacher_mvp: true
+
+model:
+  freeze_backbone: true
+  # Keep the pretrained partner decoder fixed while cross fusion adapts.
+  freeze_exo_head: true
+  freeze_ego_head: false
+  copy_exo_to_ego: false
+  # Initialize only the compatible body-pose/beta prefix after loading the official exo checkpoint.
+  copy_exo_to_ego_after_load: true
+  copy_exo_to_ego_mode: pose
+  vis_every_n_steps: 500
+  val_vis_every_n_batches: 80
+
+pipeline:
+  _target_: hmr4d.model.gvhmr.pipeline.gvhmr_pipeline.Pipeline
+  args_denoiser3d: ${network}
+  args:
+    endecoder_opt: ${endecoder}
+    normalize_cam_angvel: true
+    branch_mode: both
+    input_role: ego
+    supervise_role: both
+    ego_head_type: cpf
+    ego_motion_mode: cam_angvel_cpf
+    use_cross_view_teacher: true
+    cross_view_exo_token_dropout: 0.05
+    cross_view_exo_person_dropout: 0.0
+    cross_teacher_mvp: true
+    exo_world_loss_mode: incam_kinect
+    teacher_pose_residual_scale: 0.1
+    teacher_root_rot_residual_scale: 0.1
+    teacher_root_trans_residual_scale: 0.25
+    cross_view_extrinsic_trans_scale: 3.0
+    loss_role_alias: wearer_partner
+    weights:
+      # Wearer branch: target-view ego/camera wearer. No reprojection here.
+      wearer_simple: 1.0
+      wearer_cr_j3d: 300.0
+      wearer_cr_verts: 80.0
+      wearer_upper_j3d: 200.0
+      wearer_upper_limb: 100.0
+      wearer_lower_j3d: 150.0
+      wearer_lower_limb: 60.0
+      wearer_j3d_vel: 60.0
+      wearer_foot_rel_vel: 8.0
+      wearer_head_trans: 50.0
+      wearer_root_residual_vel_cpf: 100.0
+      wearer_direct_vel_consistency: 10.0
+      wearer_first_transl_w: 10.0
+      wearer_transl_w: 0.02
+      wearer_static_conf_bce: 5.0
+      wearer_foot_sliding: 15.0
+      teacher_residual_reg: 0.01
+      wearer_root_accel: 5.0
+      wearer_pose_accel: 1.0
+      wearer_floor: 0.3
+      wearer_floor_penetration: 0.8
+
+      # Partner branch: target-view partner, helped by full-body exo source.
+      partner_simple: 1.0
+      partner_cr_j3d: 300.0
+      partner_cr_verts: 80.0
+      partner_j2d: 30.0
+      partner_transl_c: 2.0
+      partner_transl_w: 0.03
+      partner_static_conf_bce: 0.5
+    static_conf:
+      vel_thr: 0.15
+    frame_dt: 0.033
+    foot_contact_height_thr: 0.08
+    # SMPL22 joint indices used by fk_v2.
+    ego_upper_joint_ids: [12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+    ego_upper_limb_edges: [[12, 13], [13, 16], [16, 18], [18, 20], [12, 14], [14, 17], [17, 19], [19, 21], [16, 17]]
+    ego_lower_joint_ids: [1, 2, 4, 5, 7, 8, 10, 11]
+    ego_lower_limb_edges: [[1, 4], [4, 7], [7, 10], [2, 5], [5, 8], [8, 11], [1, 2]]
+    ego_head_joint_id: 15
+    ego_head_loss_target: smpl_head_gt
+
+scheduler_cfg:
+  scheduler:
+    milestones: [40, 80]
+
+pl_trainer:
+  # Large summed geometric losses made AMP skip optimizer steps repeatedly.
+  precision: 32-true
+  log_every_n_steps: 10
+  gradient_clip_val: 0.5
+  max_epochs: 120
+  check_val_every_n_epoch: 2
+  devices: 1
+
+logger:
+  _target_: pytorch_lightning.loggers.TensorBoardLogger
+  save_dir: ${output_dir}
+  name: tb
+  version: ${now:%m%d_%H%M%S}

@@ -49,8 +49,11 @@ pipeline:
     ego_head_type: cpf
     ego_motion_mode: cam_angvel_cpf
     enable_frozen_ego_image_exo: false
-    use_interaction_condition: true
+    use_interaction_condition: false
     use_cross_view_teacher: false
+    cross_view_exo_token_dropout: 0.3
+    cross_view_exo_person_dropout: 0.1
+    loss_role_alias: wearer_partner
     weights:
       cr_j3d: 300.
       transl_c: 0.

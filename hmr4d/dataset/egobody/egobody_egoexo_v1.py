@@ -11,6 +11,7 @@ from hmr4d.utils.geo.hmr_global import get_R_c2gv
 from hmr4d.utils.net_utils import get_valid_mask, repeat_to_max_len
 from hmr4d.utils.pylogger import Log
 from hmr4d.utils.geo_transform import compute_cam_angvel
+from hmr4d.utils.geo.hmr_cam import normalize_kp2d
 
 
 def _repeat_nested(data, max_len: int):
@@ -205,6 +206,7 @@ class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
         traj = torch.load(rec_dir / 'camera_head_traj.pt', map_location='cpu')
         calib = torch.load(rec_dir / 'calibration.pt', map_location='cpu')
         feat_exo = torch.load(rec_dir / 'features_exo_hmr2.pt', map_location='cpu') if (rec_dir / 'features_exo_hmr2.pt').exists() else None
+        feat_exo_wearer = torch.load(rec_dir / 'features_exo_wearer_hmr2.pt', map_location='cpu') if (rec_dir / 'features_exo_wearer_hmr2.pt').exists() else None
         feat_ego = torch.load(rec_dir / 'features_ego_full_hmr2.pt', map_location='cpu') if (rec_dir / 'features_ego_full_hmr2.pt').exists() else None
         feat_ego_body = torch.load(rec_dir / 'features_ego_body_hmr2.pt', map_location='cpu') if (rec_dir / 'features_ego_body_hmr2.pt').exists() else None
 
@@ -229,9 +231,14 @@ class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
         ego_w = _transform_smpl_world(ego_w_raw, T_raw_to_train)
 
         f_exo = feat_exo['features'][sl].float() if feat_exo is not None else torch.zeros((end - start, 1024))
+        f_exo_wearer = feat_exo_wearer['features'][sl].float() if feat_exo_wearer is not None else torch.zeros((end - start, 1024))
         f_ego = feat_ego['features'][sl].float() if feat_ego is not None else torch.zeros((end - start, 1024))
         f_ego_body_raw = feat_ego_body['features'][sl].float() if feat_ego_body is not None else f_ego.clone()
         ego_body_bbox_valid = manifest['mask'].get('ego_body_bbox', torch.ones(L, dtype=torch.bool))[sl].bool()
+        ego_body_kp2d = manifest.get('kp2d_ego_body_gt', manifest['kp2d_ego_in_exo_gt'])[sl].float()
+        ego_body_bbx = manifest.get('bbx_ego_body_gt', manifest['bbx_ego_full'])[sl].float()
+        ego_partner_visibility = (normalize_kp2d(ego_body_kp2d, ego_body_bbx)[..., 2] > 0.5).float().mean(-1)
+        ego_partner_visibility = ego_partner_visibility * ego_body_bbox_valid.float()
         f_ego_body = torch.where(ego_body_bbox_valid[:, None], f_ego_body_raw, f_ego)
         valid = manifest['mask']['valid'][sl].bool()
         exo_valid = manifest['mask'].get('exo_gt', valid)[sl].bool() & valid
@@ -289,6 +296,7 @@ class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
             'length': end - start,
             'frame_ids': manifest['frame_ids'][sl].long(),
             'K_fullimg': manifest['K_exo'][sl].float(),
+            'K_exo': manifest['K_exo'][sl].float(),
             # Generic camera trajectory for the current exo input stream. It maps
             # y-up camera-local coordinates (+x right, +y up, -z forward) to the
             # gravity-aligned world. For EgoBody Kinect it is static; dynamic exo
@@ -308,6 +316,9 @@ class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
                 'bbx_xys': manifest['bbx_exo_gt'][sl].float(),
                 'kp2d': manifest['kp2d_exo_gt'][sl].float(),
                 'f_imgseq': f_exo,
+                'f_wearer_imgseq': f_exo_wearer,
+                'wearer_bbx_xys': manifest['bbx_ego_in_exo_gt'][sl].float(),
+                'wearer_kp2d': manifest['kp2d_ego_in_exo_gt'][sl].float(),
                 'valid': exo_valid,
             },
             'ego': {
@@ -318,6 +329,7 @@ class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
                 'kp2d': manifest['kp2d_ego_in_exo_gt'][sl].float(),
                 'f_imgseq': f_ego,
                 'f_body_imgseq': f_ego_body,
+                'partner_visibility': ego_partner_visibility.float(),
                 'bbx_body_xys': manifest.get('bbx_ego_body_gt', manifest['bbx_ego_full'])[sl].float(),
                 'kp2d_body': manifest.get('kp2d_ego_body_gt', manifest['kp2d_ego_in_exo_gt'])[sl].float(),
                 'valid': ego_valid,
@@ -333,6 +345,7 @@ class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
                 'bbx_xys': torch.ones((end - start,), dtype=torch.bool),
                 'f_imgseq': torch.full((end - start,), feat_exo is not None, dtype=torch.bool),
                 'ego_body_f_imgseq': torch.full((end - start,), feat_ego_body is not None, dtype=torch.bool) & ego_body_bbox_valid,
+                'exo_wearer_f_imgseq': torch.full((end - start,), feat_exo_wearer is not None, dtype=torch.bool),
             },
         }
 
@@ -340,7 +353,7 @@ class EgoBodyEgoExoV1Dataset(ImgfeatMotionDatasetBase):
         length = data['length']
         max_len = self.motion_frames
         out = {**data, 'length': length}
-        for key in ('frame_ids', 'K_fullimg', 'K_ego', 'R_c2gv', 'cam_angvel', 'T_world_cam', 'T_world_exo_cam'):
+        for key in ('frame_ids', 'K_fullimg', 'K_exo', 'K_ego', 'R_c2gv', 'cam_angvel', 'T_world_cam', 'T_world_exo_cam'):
             out[key] = repeat_to_max_len(out[key], max_len)
         for key in ('imgname', 'ego_imgname', 'exo_imgname'):
             if key in out:

@@ -26,6 +26,22 @@ def _body_smpl_params(params):
     return {k: v for k, v in params.items() if k in SMPL_BODY_KEYS}
 
 
+def _compose_teacher_residual(base_params, residual, pose_scale=0.1, root_rot_scale=0.1, root_trans_scale=0.25):
+    """Compose small SO(3) corrections onto an exo SMPL base motion."""
+    B, L = residual.shape[:2]
+    base_body_R = axis_angle_to_matrix(base_params["body_pose"].reshape(B, L, 21, 3))
+    delta_body_R = axis_angle_to_matrix((residual[..., :63] * pose_scale).reshape(B, L, 21, 3))
+    body_pose = matrix_to_axis_angle(delta_body_R @ base_body_R).flatten(-2)
+    base_root_R = axis_angle_to_matrix(base_params["global_orient"])
+    delta_root_R = axis_angle_to_matrix(residual[..., 63:66] * root_rot_scale)
+    global_orient = matrix_to_axis_angle(delta_root_R @ base_root_R)
+    transl = base_params["transl"] + residual[..., 66:69] * root_trans_scale
+    return {
+        "body_pose": body_pose,
+        "betas": base_params["betas"],
+        "global_orient": global_orient,
+        "transl": transl,
+    }
 
 
 def safe_masked_mean(loss, mask):
@@ -37,6 +53,22 @@ def safe_masked_mean(loss, mask):
     loss = loss * mask
     num_valid = mask.sum()
     return loss.sum() / torch.clamp(num_valid, min=1)
+
+def _loss_weight(weights, key, fallback_key=None, default=0.0):
+    if key in weights:
+        return float(weights.get(key, default))
+    if fallback_key is not None and fallback_key in weights:
+        return float(weights.get(fallback_key, default))
+    return float(default)
+
+
+def _frame_visibility_weight_from_kp2d(kp2d, target_ndim, eps=0.05):
+    if kp2d is None or kp2d.shape[-1] < 3:
+        return None
+    vis = kp2d[..., 2].clamp(0.0, 1.0).mean(dim=-1)
+    while vis.ndim < target_ndim:
+        vis = vis.unsqueeze(-1)
+    return vis.clamp_min(eps)
 
 from pytorch3d.transforms import (
     matrix_to_rotation_6d,
@@ -68,6 +100,41 @@ def _effective_branch_mode(inputs, branch_mode):
     if branch_mode in ("ego", "both") and not ("exo" in inputs and "ego" in inputs):
         return "exo"
     return branch_mode
+
+
+def _opencv_cam_to_yup_matrix(device, dtype):
+    C = torch.eye(4, device=device, dtype=dtype)
+    C[:3, :3] = torch.diag(torch.tensor([1.0, -1.0, -1.0], device=device, dtype=dtype))
+    return C
+
+
+def _R_c2gv_from_T_world_pv(T_world_pv):
+    C = _opencv_cam_to_yup_matrix(T_world_pv.device, T_world_pv.dtype)[:3, :3]
+    return T_world_pv[..., :3, :3] @ C
+
+
+@autocast(enabled=False)
+def _smpl_params_world_to_incam(smpl_params_w, T_world_pv):
+    out_dtype = smpl_params_w["transl"].dtype
+    T_world_pv_f = T_world_pv.float()
+    C = _opencv_cam_to_yup_matrix(T_world_pv_f.device, T_world_pv_f.dtype)
+    while C.ndim < T_world_pv_f.ndim:
+        C = C.unsqueeze(0)
+    T_world_opencv_cam = T_world_pv_f @ C
+    T_opencv_cam_world = torch.linalg.inv(T_world_opencv_cam)
+    betas = smpl_params_w.get("betas")
+    global_orient_c, transl_c = transform_smpl_root(
+        smpl_params_w["global_orient"].float(),
+        smpl_params_w["transl"].float(),
+        T_opencv_cam_world,
+        betas.float() if betas is not None else None,
+    )
+    return {
+        "body_pose": smpl_params_w["body_pose"],
+        "betas": smpl_params_w["betas"],
+        "global_orient": global_orient_c.to(dtype=out_dtype),
+        "transl": transl_c.to(dtype=out_dtype),
+    }
 
 
 def _split_paired_inputs(inputs, branch_mode="both", input_role=None):
@@ -107,6 +174,10 @@ def _split_paired_inputs(inputs, branch_mode="both", input_role=None):
                 flat["cam_trans_vel"] = ego_cond_for_motion["pv_cam_trans_vel"]
             if ego_cond_for_motion.get("pv_gravity_dir_cam", None) is not None:
                 flat["gravity_dir_cam"] = ego_cond_for_motion["pv_gravity_dir_cam"]
+            if ego_cond_for_motion.get("T_world_pv", None) is not None:
+                flat["R_c2gv"] = _R_c2gv_from_T_world_pv(
+                    ego_cond_for_motion["T_world_pv"].to(device=flat["bbx_xys"].device, dtype=flat["bbx_xys"].dtype)
+                )
     else:
         flat.update(
             {
@@ -129,11 +200,45 @@ def _split_paired_inputs(inputs, branch_mode="both", input_role=None):
 
 
 def _target_inputs_for_role(inputs, role):
-    """Return a flat view whose SMPL targets come from inputs[role] when available."""
+    """Return a flat target view for one physical role.
+
+    For cross-view teacher with ego as target view, the partner/person source is
+    observed in exo but predicted in ego camera-motion coordinates, so its world
+    GT is first transformed into the ego target world and then into the ego PV
+    camera for the incam fields.
+    """
     if role not in inputs:
         return inputs
     role_inputs = inputs[role]
     out = dict(inputs)
+    mask_dict = dict(inputs.get("mask", {}))
+    role_valid = mask_dict.get(f"{role}_valid", mask_dict.get("valid", None))
+    if role_valid is not None:
+        mask_dict["valid"] = role_valid
+        out["mask"] = mask_dict
+
+    target_ego_view = role == "exo" and inputs.get("_input_role", None) == "ego" and isinstance(inputs.get("ego_cond"), dict)
+    if target_ego_view and role_inputs.get("smpl_params_w") is not None:
+        ego_cond = inputs["ego_cond"]
+        smpl_w = _smpl_params_to_ego_world(role_inputs["smpl_params_w"], ego_cond)
+        T_world_pv = ego_cond.get("T_world_pv", None)
+        if T_world_pv is not None:
+            T_world_pv = T_world_pv.to(device=smpl_w["transl"].device, dtype=smpl_w["transl"].dtype)
+            out["smpl_params_c"] = _smpl_params_world_to_incam(smpl_w, T_world_pv)
+            out["R_c2gv"] = _R_c2gv_from_T_world_pv(T_world_pv)
+        else:
+            out["smpl_params_c"] = role_inputs.get("smpl_params_c")
+        out["smpl_params_w"] = smpl_w
+        out["interactee_smpl_params_c"] = out["smpl_params_c"]
+        out["interactee_smpl_params_w"] = out["smpl_params_w"]
+        ego_inputs = inputs.get("ego", {})
+        out["bbx_xys"] = ego_inputs.get("bbx_body_xys", ego_inputs.get("bbx_xys", out.get("bbx_xys")))
+        out["kp2d"] = ego_inputs.get("kp2d_body", ego_inputs.get("kp2d", out.get("kp2d")))
+        out["f_imgseq"] = ego_inputs.get("f_body_imgseq", ego_inputs.get("f_imgseq", out.get("f_imgseq")))
+        if inputs.get("K_ego", None) is not None:
+            out["K_fullimg"] = inputs["K_ego"]
+        return out
+
     if role_inputs.get("smpl_params_c") is not None:
         out["smpl_params_c"] = role_inputs["smpl_params_c"]
         out["interactee_smpl_params_c"] = role_inputs["smpl_params_c"]
@@ -146,12 +251,30 @@ def _target_inputs_for_role(inputs, role):
         out["kp2d"] = role_inputs["kp2d"]
     if role_inputs.get("f_imgseq") is not None:
         out["f_imgseq"] = role_inputs["f_imgseq"]
+    if role == "exo" and inputs.get("K_exo", None) is not None:
+        out["K_fullimg"] = inputs["K_exo"]
+    elif role == "ego" and inputs.get("K_ego", None) is not None:
+        out["K_fullimg"] = inputs["K_ego"]
+    return out
+
+
+def _target_inputs_with_gt_cache(inputs, role, endecoder):
+    out = _target_inputs_for_role(inputs, role)
+    if out.get("interactee_smpl_params_c", None) is None:
+        return out
+    with torch.no_grad():
+        gt_verts437, gt_j3d = endecoder.smplx_model(**_body_smpl_params(out["interactee_smpl_params_c"]))
+        root_ = gt_j3d[:, :, [11, 12], :].mean(-2, keepdim=True)
+    out["gt_j3d"] = gt_j3d
+    out["gt_cr_coco17"] = gt_j3d - root_
+    out["gt_c_verts437"] = gt_verts437
+    out["gt_cr_verts437"] = gt_verts437 - root_
     return out
 
 
 def _mask_for_role(inputs, role):
     mask = inputs["mask"].get(f"{role}_valid", inputs["mask"]["valid"])
-    return mask & inputs["mask"]["valid"]
+    return mask & inputs["mask"].get("valid", mask)
 
 
 def _targets_for_ego_world(inputs):
@@ -765,6 +888,7 @@ class Pipeline(nn.Module):
             "f_ego_head": None if ego_motion_mode == "cam_angvel_cpf" else (_make_ego_head_condition(ego_cond) if active_ego else None),
             "f_ego_hand": None if ego_motion_mode == "cam_angvel_cpf" else (_make_ego_hand_condition(ego_cond) if active_ego else None),
             "f_interaction": _make_interaction_condition(inputs, ego_cond) if self.args.get("use_interaction_condition", False) else None,
+            "ego_partner_visibility": ego_inputs.get("partner_visibility") if isinstance(ego_inputs, dict) else None,
         }
         if branch_mode == "both" and ego_inputs is not None and self.args.get("add_other_role_image_condition", False):
             f_ego_imgseq = ego_inputs.get("f_body_imgseq", ego_inputs.get("f_imgseq"))
@@ -772,65 +896,192 @@ class Pipeline(nn.Module):
                 f_condition["f_ego_imgseq"] = f_ego_imgseq
 
         if (
-            train
-            and self.training
-            and branch_mode == "both"
+            branch_mode == "both"
+            and input_role == "ego"
             and ego_inputs is not None
             and self.args.get("use_cross_view_teacher", False)
         ):
-            cross_role = "exo" if input_role == "ego" else "ego"
-            cross_inputs = inputs.get(cross_role, None)
-            if isinstance(cross_inputs, dict):
-                if cross_role == "ego":
-                    cross_bbx = cross_inputs.get("bbx_body_xys", cross_inputs.get("bbx_xys"))
-                    cross_kp2d = cross_inputs.get("kp2d_body", cross_inputs.get("kp2d"))
-                    cross_img = cross_inputs.get("f_body_imgseq", cross_inputs.get("f_imgseq"))
-                    cross_K = inputs.get("K_ego", inputs.get("K_fullimg"))
-                    cross_angvel = None
-                    cross_trans_vel = None
-                    cross_gravity = None
-                    if isinstance(ego_cond, dict):
-                        cross_angvel = ego_cond.get("pv_cam_angvel", ego_cond.get("head_angvel", None))
-                        cross_trans_vel = ego_cond.get("pv_cam_trans_vel", None)
-                        cross_gravity = ego_cond.get("pv_gravity_dir_cam", None)
-                else:
-                    cross_bbx = cross_inputs.get("bbx_xys")
-                    cross_kp2d = cross_inputs.get("kp2d")
-                    cross_img = cross_inputs.get("f_imgseq")
-                    cross_K = inputs.get("K_fullimg")
-                    cross_angvel = inputs.get("exo_cam_angvel", None)
-                    cross_trans_vel = inputs.get("exo_cam_trans_vel", None)
-                    cross_gravity = inputs.get("exo_gravity_dir_cam", None)
+            exo_token_dropout = float(self.args.get("cross_view_exo_token_dropout", 0.0))
+            exo_person_dropout = float(self.args.get("cross_view_exo_person_dropout", 0.0))
+            force_no_cross_source = bool(self.args.get("cross_view_force_no_source", False))
+            cross_stats = {}
+            cross_extrinsic = None
+            T_abs_exo_cam = inputs.get("T_world_exo_cam", inputs.get("T_world_cam", None))
+            if isinstance(ego_cond, dict):
+                T_abs_to_target = ego_cond.get("T_abs_to_ego_world", None)
+                T_target_pv = ego_cond.get("T_world_pv", None)
+                if T_abs_exo_cam is not None and T_abs_to_target is not None and T_target_pv is not None:
+                    T_abs_exo_cam = T_abs_exo_cam.to(device=f_cam_angvel.device, dtype=f_cam_angvel.dtype)
+                    T_abs_to_target = T_abs_to_target.to(device=f_cam_angvel.device, dtype=f_cam_angvel.dtype)
+                    T_target_pv = T_target_pv.to(device=f_cam_angvel.device, dtype=f_cam_angvel.dtype)
+                    T_target_from_exo = _invert_T(T_target_pv) @ (T_abs_to_target @ T_abs_exo_cam)
+                    rel_rot6d = matrix_to_rotation_6d(T_target_from_exo[..., :3, :3])
+                    trans_scale = float(self.args.get("cross_view_extrinsic_trans_scale", 3.0))
+                    rel_trans = T_target_from_exo[..., :3, 3] / max(trans_scale, 1e-6)
+                    cross_extrinsic = torch.cat([rel_rot6d, rel_trans], dim=-1)
 
-                if cross_bbx is not None and cross_kp2d is not None and cross_img is not None:
-                    cross_obs = normalize_kp2d(cross_kp2d, cross_bbx)
-                    cross_mask = inputs["mask"].get(f"{cross_role}_valid", inputs["mask"]["valid"])
-                    cross_obs[~cross_mask] = 0
-                    cross_cliff = compute_bbox_info_bedlam(cross_bbx, cross_K) if cross_K is not None else cliff_cam
-                    if cross_angvel is None:
-                        cross_angvel = f_cam_angvel.new_zeros(B_cond, L_cond, 6)
-                    else:
-                        cross_angvel = cross_angvel.to(device=f_cam_angvel.device, dtype=f_cam_angvel.dtype)
-                        if self.args.normalize_cam_angvel:
-                            cross_angvel = (cross_angvel - self.cam_angvel_mean) / self.cam_angvel_std
-                    if cross_trans_vel is not None:
-                        cross_trans_vel = cross_trans_vel.to(device=f_cam_angvel.device, dtype=f_cam_angvel.dtype)
-                    if cross_gravity is not None:
-                        cross_gravity = cross_gravity.to(device=f_cam_angvel.device, dtype=f_cam_angvel.dtype)
-                    f_condition.update({
-                        "cross_obs": cross_obs,
-                        "cross_f_cliffcam": cross_cliff,
-                        "cross_f_cam_angvel": cross_angvel,
-                        "cross_f_cam_trans_vel": cross_trans_vel,
-                        "cross_f_gravity_dir": cross_gravity,
-                        "cross_f_imgseq": cross_img,
-                    })
-                    outputs["cross_view_teacher_role"] = cross_role
+            def _as_condition_tensor(x, like):
+                if x is None:
+                    return None
+                x = x.to(device=like.device, dtype=like.dtype)
+                if x.shape[0] == 1 and like.shape[0] > 1:
+                    x = x.expand(like.shape[0], -1, *x.shape[2:])
+                if x.shape[1] != like.shape[1]:
+                    x = x[:, : like.shape[1]]
+                return x
+
+            def _prep_cross_person(
+                prefix,
+                bbx,
+                kp2d,
+                img,
+                K,
+                valid_mask,
+                feature_mask,
+                person_name,
+            ):
+                if bbx is None or kp2d is None or img is None:
+                    return False
+                valid_mask = _as_condition_tensor(valid_mask, f_cam_angvel)
+                valid_mask = valid_mask.bool() if valid_mask is not None else None
+                feature_mask = _as_condition_tensor(feature_mask, f_cam_angvel)
+                if feature_mask is not None:
+                    feature_mask = feature_mask.bool()
+                    if not feature_mask.any():
+                        return False
+                    valid_mask = feature_mask if valid_mask is None else (valid_mask & feature_mask)
+
+                cross_obs = normalize_kp2d(kp2d, bbx)
+                if valid_mask is not None:
+                    cross_obs[~valid_mask] = 0
+                cross_cliff = compute_bbox_info_bedlam(bbx, K)
+                cross_angvel = _identity_cam_angvel(B_cond, L_cond, f_cam_angvel.device, f_cam_angvel.dtype)
+                if self.args.normalize_cam_angvel:
+                    cross_angvel = (cross_angvel - self.cam_angvel_mean) / self.cam_angvel_std
+                cross_trans_vel = f_cam_angvel.new_zeros(B_cond, L_cond, 3)
+                cross_gravity = f_cam_angvel.new_zeros(B_cond, L_cond, 3)
+                cross_gravity[..., 1] = 1.0
+                img = img.to(device=f_cam_angvel.device, dtype=f_cam_angvel.dtype)
+                extrinsic = None if cross_extrinsic is None else cross_extrinsic.to(
+                    device=f_cam_angvel.device, dtype=f_cam_angvel.dtype
+                )
+
+                source_valid = torch.ones(cross_obs.shape[:2], device=cross_obs.device, dtype=torch.bool)
+                if valid_mask is not None:
+                    source_valid &= valid_mask.to(device=cross_obs.device)
+                if force_no_cross_source:
+                    source_valid.zero_()
+                if self.training:
+                    keep = torch.ones_like(source_valid)
+                    if exo_token_dropout > 0:
+                        keep &= torch.rand_like(keep, dtype=torch.float32) >= exo_token_dropout
+                    if exo_person_dropout > 0:
+                        person_keep = torch.rand((keep.shape[0], 1), device=keep.device) >= exo_person_dropout
+                        keep &= person_keep
+                        cross_stats[f"{person_name}_person_keep_frac"] = person_keep.float().mean().detach()
+                    cross_stats[f"{person_name}_token_keep_frac"] = keep.float().mean().detach()
+                    source_valid &= keep
+
+                    cross_obs = cross_obs.masked_fill(~keep[..., None, None], 0.0)
+                    cross_cliff = cross_cliff.masked_fill(~keep[..., None], 0.0)
+                    cross_angvel = cross_angvel.masked_fill(~keep[..., None], 0.0)
+                    cross_trans_vel = cross_trans_vel.masked_fill(~keep[..., None], 0.0)
+                    cross_gravity = cross_gravity.masked_fill(~keep[..., None], 0.0)
+                    img = img.masked_fill(~keep[..., None], 0.0)
+                    if extrinsic is not None:
+                        extrinsic = extrinsic.masked_fill(~keep[..., None], 0.0)
+
+                cross_stats[f"{person_name}_source_valid_frac"] = source_valid.float().mean().detach()
+                f_condition.update({
+                    f"{prefix}_obs": cross_obs,
+                    f"{prefix}_f_cliffcam": cross_cliff,
+                    f"{prefix}_f_cam_angvel": cross_angvel,
+                    f"{prefix}_f_cam_trans_vel": cross_trans_vel,
+                    f"{prefix}_f_gravity_dir": cross_gravity,
+                    f"{prefix}_f_imgseq": img,
+                    f"{prefix}_f_extrinsic": extrinsic,
+                    f"{prefix}_key_padding_mask": ~source_valid,
+                })
+                return True
+
+            cross_inputs = inputs.get("exo", None)
+            added_people = []
+            if isinstance(cross_inputs, dict):
+                cross_K = inputs.get("K_exo", inputs.get("K_fullimg"))
+                exo_valid = inputs["mask"].get("exo_valid", inputs["mask"]["valid"])
+                ego_valid = inputs["mask"].get("ego_valid", inputs["mask"]["valid"])
+                if _prep_cross_person(
+                    "cross_interactee",
+                    cross_inputs.get("bbx_xys"),
+                    cross_inputs.get("kp2d"),
+                    cross_inputs.get("f_imgseq"),
+                    cross_K,
+                    exo_valid,
+                    inputs["mask"].get("f_imgseq", None),
+                    "interactee",
+                ):
+                    added_people.append("interactee")
+                if _prep_cross_person(
+                    "cross_wearer",
+                    cross_inputs.get("wearer_bbx_xys"),
+                    cross_inputs.get("wearer_kp2d"),
+                    cross_inputs.get("f_wearer_imgseq"),
+                    cross_K,
+                    ego_valid,
+                    inputs["mask"].get("exo_wearer_f_imgseq", None),
+                    "wearer",
+                ):
+                    added_people.append("wearer")
+            if added_people:
+                for stat_name, stat_value in cross_stats.items():
+                    outputs[f"cross_view_{stat_name}"] = stat_value
+
+        ego_condition_ablation = self.args.get("cross_view_ego_condition_ablation", "full")
+        if ego_condition_ablation not in ("full", "no-visual", "no-motion", "none"):
+            raise ValueError(f"Unsupported cross_view_ego_condition_ablation: {ego_condition_ablation}")
+        if ego_condition_ablation in ("no-visual", "none"):
+            for condition_name in ("obs", "f_imgseq", "f_ego_imgseq", "f_interaction"):
+                value = f_condition.get(condition_name)
+                if torch.is_tensor(value):
+                    f_condition[condition_name] = torch.zeros_like(value)
+            f_condition["ego_partner_visibility"] = None
+        if ego_condition_ablation in ("no-motion", "none"):
+            for condition_name in ("f_cam_angvel", "f_cam_trans_vel", "f_ego_head", "f_ego_hand"):
+                value = f_condition.get(condition_name)
+                if torch.is_tensor(value):
+                    f_condition[condition_name] = torch.zeros_like(value)
+
         if train and self.training:
             f_condition = randomly_set_null_condition(f_condition, 0.1)
 
         # Forward & output
+        bad_parameters = [
+            name for name, parameter in self.denoiser3d.named_parameters()
+            if parameter.requires_grad and not torch.isfinite(parameter).all()
+        ]
+        if bad_parameters:
+            names = ", ".join(bad_parameters[:12])
+            raise FloatingPointError(f"Non-finite trainable denoiser parameters: {names}")
+        for condition_name, value in f_condition.items():
+            if not torch.is_tensor(value) or value.dtype == torch.bool:
+                continue
+            finite = torch.isfinite(value)
+            if not finite.all():
+                bad_per_sample = (~finite).reshape(finite.shape[0], -1).sum(dim=1)
+                bad_samples = torch.nonzero(bad_per_sample, as_tuple=False).flatten().tolist()
+                raise FloatingPointError(
+                    f"Non-finite denoiser condition {condition_name}: "
+                    f"count={int((~finite).sum())}, batch_indices={bad_samples}"
+                )
         model_output = self.denoiser3d(length=length, **f_condition)  # pred_x, pred_cam, static_conf_logits
+        for gate_name in ("cross_partner_gate", "cross_wearer_gate"):
+            gate_value = model_output.get(gate_name, None)
+            if gate_value is not None:
+                outputs[f"cross_view_{gate_name.removeprefix('cross_')}"] = gate_value.detach().mean()
+        for output_name in ("pred_x", "pred_x_ego"):
+            value = model_output.get(output_name, None)
+            if value is not None and not torch.isfinite(value).all():
+                raise FloatingPointError(f"Non-finite {output_name} from denoiser3d")
         frozen_ego_feature = None
         if ego_inputs is not None:
             frozen_ego_feature = ego_inputs.get("f_body_imgseq", ego_inputs.get("f_imgseq"))
@@ -922,8 +1173,74 @@ class Pipeline(nn.Module):
                     "transl": compute_transl_full_cam(model_output["pred_cam_ego"], inputs["bbx_xys"], inputs["K_fullimg"]),
                 }
 
+        source_base = model_output.get("cross_source_base", {})
+        use_teacher_source_output = not bool(self.args.get("cross_view_force_no_source", False))
+        if (
+            self.args.get("cross_teacher_mvp", False)
+            and use_teacher_source_output
+            and source_base
+            and isinstance(ego_cond, dict)
+        ):
+            source_specs = {
+                "partner": (
+                    inputs.get("exo", {}).get("bbx_xys"),
+                    "teacher_partner_motion",
+                ),
+                "wearer": (
+                    inputs.get("exo", {}).get("wearer_bbx_xys"),
+                    "teacher_wearer_motion",
+                ),
+            }
+            T_world_exo_cam = inputs.get("T_world_exo_cam", inputs.get("T_world_cam", None))
+            K_exo = inputs.get("K_exo", inputs.get("K_fullimg"))
+            for source_name, (source_bbx, output_name) in source_specs.items():
+                base_output = source_base.get(source_name, None)
+                if base_output is None or source_bbx is None or T_world_exo_cam is None:
+                    continue
+                base_decode = self.endecoder.decode(base_output["pred_x"])
+                base_c = {
+                    "body_pose": base_decode["body_pose"],
+                    "betas": base_decode["betas"],
+                    "global_orient": base_decode["global_orient"],
+                    "transl": compute_transl_full_cam(base_output["pred_cam"], source_bbx, K_exo),
+                }
+                base_abs_world = _smpl_params_incam_to_world(base_c, T_world_exo_cam)
+                base_target_world = _smpl_params_to_ego_world(base_abs_world, ego_cond)
+                teacher_motion = _compose_teacher_residual(
+                    base_target_world,
+                    base_output["residual"],
+                    pose_scale=float(self.args.get("teacher_pose_residual_scale", 0.1)),
+                    root_rot_scale=float(self.args.get("teacher_root_rot_residual_scale", 0.1)),
+                    root_trans_scale=float(self.args.get("teacher_root_trans_residual_scale", 0.25)),
+                )
+                outputs[f"exo_{source_name}_base_motion"] = base_target_world
+                outputs[f"teacher_{source_name}_residual"] = base_output["residual"]
+                outputs[output_name] = teacher_motion
+                outputs[f"teacher_{source_name}_static_conf_logits"] = base_output.get("static_conf_logits")
+
+            teacher_wearer = outputs.get("teacher_wearer_motion", None)
+            if teacher_wearer is not None:
+                # Canonical wearer output now starts from complete exo pose/root and receives ego-conditioned corrections.
+                outputs["pred_smpl_params_global_ego"] = teacher_wearer
+                outputs["pred_smpl_params_global_ego_direct"] = teacher_wearer
+                outputs["pred_smpl_params_global_ego_coarse"] = teacher_wearer
+                if "pred_smpl_params_cpf_ego" in outputs:
+                    outputs["pred_smpl_params_cpf_ego"] = {
+                        **outputs["pred_smpl_params_cpf_ego"],
+                        "body_pose": teacher_wearer["body_pose"],
+                        "betas": teacher_wearer["betas"],
+                    }
+
+            teacher_partner = outputs.get("teacher_partner_motion", None)
+            if teacher_partner is not None and ego_cond.get("T_world_pv", None) is not None:
+                teacher_partner_c = _smpl_params_world_to_incam(teacher_partner, ego_cond["T_world_pv"])
+                outputs["teacher_partner_motion_incam"] = teacher_partner_c
+                outputs["pred_smpl_params_incam"] = teacher_partner_c
+                outputs["pred_smpl_params_kinect_from_incam"] = teacher_partner
+                outputs["pred_smpl_params_global"] = teacher_partner
+
         if not train:
-            if active_exo:
+            if active_exo and "teacher_partner_motion" not in outputs:
                 pred_smpl_params_global = get_smpl_params_w_Rt_v2(  # This function has for-loop
                     global_orient_gv=decode_dict["global_orient_gv"],
                     local_transl_vel=decode_dict["local_transl_vel"],
@@ -978,6 +1295,16 @@ class Pipeline(nn.Module):
         # ========== Compute Loss ========== #
         total_loss = 0
         mask = inputs["mask"]["valid"]  # (B, L)
+        residual_reg_weight = _loss_weight(self.weights, "teacher_residual_reg")
+        if residual_reg_weight > 0:
+            for role in ("wearer", "partner"):
+                residual = outputs.get(f"teacher_{role}_residual", None)
+                if residual is None:
+                    continue
+                role_mask = _mask_for_role(inputs, "ego" if role == "wearer" else "exo")
+                residual_reg = safe_masked_mean(residual.pow(2), role_mask[..., None])
+                total_loss += residual_reg * residual_reg_weight
+                outputs[f"teacher_residual_reg_loss_{role}"] = residual_reg
 
         has_ego = active_ego and "pred_x_ego" in model_output
         supervise_ego = supervise_role in ("ego", "both")
@@ -987,10 +1314,6 @@ class Pipeline(nn.Module):
         # Ego head loss (如果存在)
         if has_ego and supervise_ego:
             pred_x_ego = model_output["pred_x_ego"]
-            if torch.isnan(pred_x_ego).any() or torch.isinf(pred_x_ego).any():
-                Log.warning("NaN/Inf found in pred_x_ego! Setting to zero.")
-                pred_x_ego = torch.nan_to_num(pred_x_ego, nan=0.0, posinf=1e3, neginf=-1e3)
-            
             if pred_x_ego.size(-1) == 145 or self.args.get("ego_head_type", "cpf") == "cpf":
                 target_x = _encode_ego_cpf_targets(inputs, self.endecoder, self.args, include_local_transl_vel=pred_x_ego.size(-1) >= 148)
             else:
@@ -999,25 +1322,26 @@ class Pipeline(nn.Module):
             simple_loss_ego = F.mse_loss(pred_x_ego, target_x, reduction="none")
             ego_mask = _mask_for_role(inputs, "ego")
             simple_loss_ego = safe_masked_mean(simple_loss_ego, ego_mask[:, :, None])
-            total_loss += simple_loss_ego
+            total_loss += simple_loss_ego * _loss_weight(self.weights, "wearer_simple", default=1.0)
             outputs["simple_loss_ego"] = simple_loss_ego
         
-        # Exo head loss (如果存在且未冻结)
+        # Exo/partner head loss. In cross-view teacher with ego target view,
+        # pred_x represents the partner decoded in the ego target coordinate
+        # system, not the flat wearer fields routed through inputs.
+        exo_loss_inputs = None
         if active_exo and supervise_exo and (not has_ego or not self.args.get("freeze_exo_head", False)):
             pred_x = model_output["pred_x"]
-            if torch.isnan(pred_x).any() or torch.isinf(pred_x).any():
-                Log.warning("NaN/Inf found in pred_x! Setting to zero.")
-                pred_x = torch.nan_to_num(pred_x, nan=0.0, posinf=1e3, neginf=-1e3)
-            
-            target_x = self.endecoder.encode(inputs)
+            exo_loss_inputs = _target_inputs_with_gt_cache(inputs, "exo", self.endecoder)
+            target_x = self.endecoder.encode(exo_loss_inputs)
             simple_loss = F.mse_loss(pred_x, target_x, reduction="none")
-            mask_simple = mask[:, :, None].expand(-1, -1, pred_x.size(2)).clone()
-            spv_mask = inputs["mask"]["spv_incam_only"]
+            exo_mask = exo_loss_inputs["mask"]["valid"]
+            mask_simple = exo_mask[:, :, None].expand(-1, -1, pred_x.size(2)).clone()
+            spv_mask = exo_loss_inputs["mask"].get("spv_incam_only", torch.zeros_like(exo_mask, dtype=torch.bool))
             if spv_mask.ndim == 1:
-                spv_mask = spv_mask[:, None].expand_as(mask)
+                spv_mask = spv_mask[:, None].expand_as(exo_mask)
             mask_simple[..., 142:] = mask_simple[..., 142:] & (~spv_mask[..., None])
-            simple_loss = (simple_loss * mask_simple).mean()
-            total_loss += simple_loss
+            simple_loss = safe_masked_mean(simple_loss, mask_simple)
+            total_loss += simple_loss * _loss_weight(self.weights, "partner_simple", default=1.0)
             outputs["simple_loss"] = simple_loss
 
         # 2. Extra loss
@@ -1032,14 +1356,16 @@ class Pipeline(nn.Module):
             total_loss += ego_global_loss
             outputs.update(ego_global_loss_dict)
         
-        # Exo extra loss (如果存在且未冻结)
+        # Exo/partner extra loss (如果存在且未冻结)
         if active_exo and supervise_exo and (not has_ego or not self.args.get("freeze_exo_head", False)):
+            if exo_loss_inputs is None:
+                exo_loss_inputs = _target_inputs_with_gt_cache(inputs, "exo", self.endecoder)
             extra_funcs = [
                 compute_extra_incam_loss,
                 compute_extra_global_loss,
             ]
             for extra_func in extra_funcs:
-                extra_loss, extra_loss_dict = extra_func(inputs, outputs, self)
+                extra_loss, extra_loss_dict = extra_func(exo_loss_inputs, outputs, self)
                 total_loss += extra_loss
                 outputs.update(extra_loss_dict)
 
@@ -1051,7 +1377,7 @@ def randomly_set_null_condition(f_condition, uncond_prob=0.1):
     """Conditions are in shape (B, L, *)"""
     keys = list(f_condition.keys())
     for k in keys:
-        if f_condition[k] is None:
+        if f_condition[k] is None or k.startswith("cross_") or k == "ego_partner_visibility":
             continue
         f_condition[k] = f_condition[k].clone()
         mask = torch.rand(f_condition[k].shape[:2], device=f_condition[k].device) < uncond_prob
@@ -1082,17 +1408,28 @@ def compute_extra_incam_loss_ego(inputs, outputs, ppl):
     gt_j3d = endecoder.fk_v2(**_body_smpl_params(gt_smpl_params))
     gt_cr_j3d = gt_j3d - gt_j3d[:, :, :1]
 
-    if weights.cr_j3d > 0.0:
+    cr_j3d_weight = _loss_weight(weights, "wearer_cr_j3d", "cr_j3d")
+    if cr_j3d_weight > 0.0:
         cr_j3d_loss = F.mse_loss(pred_cr_j3d, gt_cr_j3d, reduction="none")
         cr_j3d_loss = safe_masked_mean(cr_j3d_loss, mask[..., None, None])
-        extra_loss += cr_j3d_loss * weights.cr_j3d
+        extra_loss += cr_j3d_loss * cr_j3d_weight
         extra_loss_dict["cr_j3d_loss_ego"] = cr_j3d_loss
 
-    upper_j3d_weight = weights.get("ego_upper_j3d", 0.0)
+    j3d_vel_weight = _loss_weight(weights, "wearer_j3d_vel")
+    if j3d_vel_weight > 0 and pred_cr_j3d.size(1) > 1:
+        vel_mask = mask[:, 1:] & mask[:, :-1]
+        pred_vel = pred_cr_j3d[:, 1:] - pred_cr_j3d[:, :-1]
+        gt_vel = gt_cr_j3d[:, 1:] - gt_cr_j3d[:, :-1]
+        j3d_vel_loss = F.smooth_l1_loss(pred_vel, gt_vel, reduction="none", beta=0.02)
+        j3d_vel_loss = safe_masked_mean(j3d_vel_loss, vel_mask[..., None, None])
+        extra_loss += j3d_vel_loss * j3d_vel_weight
+        extra_loss_dict["j3d_vel_loss_ego"] = j3d_vel_loss
+
+    upper_j3d_weight = _loss_weight(weights, "wearer_upper_j3d", "ego_upper_j3d")
     if upper_j3d_weight > 0:
-        # COCO17: shoulders 5/6, elbows 7/8, wrists 9/10.
+        # SMPL22: neck/collars/head/shoulders/elbows/wrists.
         upper_ids = torch.as_tensor(
-            args.get("ego_upper_joint_ids", [5, 6, 7, 8, 9, 10]),
+            args.get("ego_upper_joint_ids", [12, 13, 14, 15, 16, 17, 18, 19, 20, 21]),
             device=pred_cr_j3d.device,
             dtype=torch.long,
         )
@@ -1103,10 +1440,13 @@ def compute_extra_incam_loss_ego(inputs, outputs, ppl):
         extra_loss += upper_j3d_loss * upper_j3d_weight
         extra_loss_dict["upper_j3d_loss_ego"] = upper_j3d_loss
 
-    upper_limb_weight = weights.get("ego_upper_limb", 0.0)
+    upper_limb_weight = _loss_weight(weights, "wearer_upper_limb", "ego_upper_limb")
     if upper_limb_weight > 0:
         limb_edges = torch.as_tensor(
-            args.get("ego_upper_limb_edges", [[5, 7], [7, 9], [6, 8], [8, 10], [5, 6], [5, 11], [6, 12]]),
+            args.get(
+                "ego_upper_limb_edges",
+                [[12, 13], [13, 16], [16, 18], [18, 20], [12, 14], [14, 17], [17, 19], [19, 21], [16, 17]],
+            ),
             device=pred_cr_j3d.device,
             dtype=torch.long,
         )
@@ -1117,7 +1457,58 @@ def compute_extra_incam_loss_ego(inputs, outputs, ppl):
         extra_loss += upper_limb_loss * upper_limb_weight
         extra_loss_dict["upper_limb_loss_ego"] = upper_limb_loss
 
-    if weights.cr_verts > 0:
+    lower_j3d_weight = _loss_weight(weights, "wearer_lower_j3d", "ego_lower_j3d")
+    lower_ids = torch.as_tensor(
+        args.get("ego_lower_joint_ids", [1, 2, 4, 5, 7, 8, 10, 11]),
+        device=pred_cr_j3d.device,
+        dtype=torch.long,
+    )
+    if lower_j3d_weight > 0:
+        pred_lower = pred_cr_j3d.index_select(-2, lower_ids)
+        gt_lower = gt_cr_j3d.index_select(-2, lower_ids)
+        lower_j3d_loss = F.mse_loss(pred_lower, gt_lower, reduction="none")
+        lower_j3d_loss = safe_masked_mean(lower_j3d_loss, mask[..., None, None])
+        extra_loss += lower_j3d_loss * lower_j3d_weight
+        extra_loss_dict["lower_j3d_loss_ego"] = lower_j3d_loss
+
+    lower_limb_weight = _loss_weight(weights, "wearer_lower_limb", "ego_lower_limb")
+    if lower_limb_weight > 0:
+        lower_edges = torch.as_tensor(
+            args.get("ego_lower_limb_edges", [[1, 4], [4, 7], [7, 10], [2, 5], [5, 8], [8, 11], [1, 2]]),
+            device=pred_cr_j3d.device,
+            dtype=torch.long,
+        )
+        pred_lower_limb = pred_cr_j3d.index_select(-2, lower_edges[:, 1]) - pred_cr_j3d.index_select(
+            -2, lower_edges[:, 0]
+        )
+        gt_lower_limb = gt_cr_j3d.index_select(-2, lower_edges[:, 1]) - gt_cr_j3d.index_select(
+            -2, lower_edges[:, 0]
+        )
+        lower_limb_loss = F.smooth_l1_loss(pred_lower_limb, gt_lower_limb, reduction="none", beta=0.03)
+        lower_limb_loss = safe_masked_mean(lower_limb_loss, mask[..., None, None])
+        extra_loss += lower_limb_loss * lower_limb_weight
+        extra_loss_dict["lower_limb_loss_ego"] = lower_limb_loss
+
+    foot_rel_vel_weight = _loss_weight(weights, "wearer_foot_rel_vel", "ego_foot_rel_vel")
+    if foot_rel_vel_weight > 0 and pred_cr_j3d.size(1) > 1:
+        frame_dt = max(float(args.get("frame_dt", 0.033)), 1e-6)
+        foot_ids = torch.as_tensor(
+            args.get("floor_joint_ids", [7, 10, 8, 11]), device=pred_cr_j3d.device, dtype=torch.long
+        )
+        pred_rel_foot = pred_cr_j3d.index_select(-2, foot_ids)
+        gt_rel_foot = gt_cr_j3d.index_select(-2, foot_ids)
+        pred_rel_foot_vel = (pred_rel_foot[:, 1:] - pred_rel_foot[:, :-1]) / frame_dt
+        gt_rel_foot_vel = (gt_rel_foot[:, 1:] - gt_rel_foot[:, :-1]) / frame_dt
+        foot_vel_mask = mask[:, 1:] & mask[:, :-1]
+        foot_rel_vel_loss = F.smooth_l1_loss(
+            pred_rel_foot_vel, gt_rel_foot_vel, reduction="none", beta=0.05
+        )
+        foot_rel_vel_loss = safe_masked_mean(foot_rel_vel_loss, foot_vel_mask[..., None, None])
+        extra_loss += foot_rel_vel_loss * foot_rel_vel_weight
+        extra_loss_dict["foot_rel_vel_loss_ego"] = foot_rel_vel_loss
+
+    cr_verts_weight = _loss_weight(weights, "wearer_cr_verts", "cr_verts")
+    if cr_verts_weight > 0:
         pred_verts437, pred_j17 = endecoder.smplx_model(**_body_smpl_params(pred_smpl_params))
         pred_root = pred_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
         pred_cr_verts437 = pred_verts437 - pred_root
@@ -1128,7 +1519,7 @@ def compute_extra_incam_loss_ego(inputs, outputs, ppl):
 
         cr_vert_loss = F.mse_loss(pred_cr_verts437, gt_cr_verts437, reduction="none")
         cr_vert_loss = safe_masked_mean(cr_vert_loss, mask[:, :, None, None])
-        extra_loss += cr_vert_loss * weights.cr_verts
+        extra_loss += cr_vert_loss * cr_verts_weight
         extra_loss_dict["cr_verts_loss_ego"] = cr_vert_loss
 
     return extra_loss, extra_loss_dict
@@ -1156,20 +1547,20 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
 
     gt_w_j3d_for_head = None
 
-    if pred_world is not None and weights.transl_w > 0:
+    if pred_world is not None and _loss_weight(weights, "wearer_transl_w", "transl_w") > 0:
         trans_w_loss = F.l1_loss(pred_world["transl"], gt_transl, reduction="none")
         trans_w_loss = safe_masked_mean(trans_w_loss, mask[..., None])
-        extra_loss += trans_w_loss * weights.transl_w
+        extra_loss += trans_w_loss * _loss_weight(weights, "wearer_transl_w", "transl_w")
         extra_loss_dict["transl_w_loss_ego"] = trans_w_loss
 
-    first_transl_weight = weights.get("ego_first_transl_w", 0.0)
+    first_transl_weight = _loss_weight(weights, "wearer_first_transl_w", "ego_first_transl_w")
     if pred_world is not None and first_transl_weight > 0:
         first_loss = F.l1_loss(pred_world["transl"][:, :1], gt_transl[:, :1], reduction="none")
         first_loss = safe_masked_mean(first_loss, mask[:, :1, None])
         extra_loss += first_loss * first_transl_weight
         extra_loss_dict["first_transl_w_loss_ego"] = first_loss
 
-    local_vel_weight = weights.get("ego_local_transl_vel", 0.0)
+    local_vel_weight = _loss_weight(weights, "wearer_root_residual_vel_cpf", "ego_local_transl_vel")
     if local_vel_weight > 0 and "decode_dict_ego" in outputs and "root_residual_vel_cpf" in outputs["decode_dict_ego"]:
         ego_cond = inputs.get("ego_cond", {})
         gt_root_orient_cpf, gt_root_trans_cpf = _transform_root_to_local(
@@ -1189,7 +1580,7 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
         extra_loss += residual_vel_loss * local_vel_weight
         extra_loss_dict["root_residual_vel_cpf_loss_ego"] = residual_vel_loss
 
-        direct_vel_weight = weights.get("ego_direct_vel_consistency", 0.0)
+        direct_vel_weight = _loss_weight(weights, "wearer_direct_vel_consistency", "ego_direct_vel_consistency")
         if direct_vel_weight > 0 and "root_trans_cpf" in outputs["decode_dict_ego"]:
             pred_direct_vel_cpf = get_local_transl_vel(
                 outputs["decode_dict_ego"]["root_trans_cpf"],
@@ -1205,7 +1596,7 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
             extra_loss += direct_vel_loss * direct_vel_weight
             extra_loss_dict["direct_vel_consistency_loss_ego"] = direct_vel_loss
 
-    root_accel_weight = weights.get("ego_root_accel", 0.0)
+    root_accel_weight = _loss_weight(weights, "wearer_root_accel", "ego_root_accel")
     if pred_world is not None and root_accel_weight > 0 and gt_transl.size(1) > 2:
         accel_mask = mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2]
         pred_accel = pred_world["transl"][:, 2:] - 2.0 * pred_world["transl"][:, 1:-1] + pred_world["transl"][:, :-2]
@@ -1215,7 +1606,7 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
         extra_loss += root_accel_loss * root_accel_weight
         extra_loss_dict["root_accel_loss_ego"] = root_accel_loss
 
-    pose_accel_weight = weights.get("ego_pose_accel", 0.0)
+    pose_accel_weight = _loss_weight(weights, "wearer_pose_accel", "ego_pose_accel")
     if pred_world is not None and pose_accel_weight > 0 and pred_world["body_pose"].size(1) > 2:
         accel_mask = mask[:, 2:] & mask[:, 1:-1] & mask[:, :-2]
         pred_pose_accel = pred_world["body_pose"][:, 2:] - 2.0 * pred_world["body_pose"][:, 1:-1] + pred_world["body_pose"][:, :-2]
@@ -1226,8 +1617,8 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
         extra_loss += pose_accel_loss * pose_accel_weight
         extra_loss_dict["pose_accel_loss_ego"] = pose_accel_loss
 
-    floor_weight = weights.get("ego_floor", 0.0)
-    floor_pen_weight = weights.get("ego_floor_penetration", floor_weight)
+    floor_weight = _loss_weight(weights, "wearer_floor", "ego_floor")
+    floor_pen_weight = _loss_weight(weights, "wearer_floor_penetration", "ego_floor_penetration", floor_weight)
     pred_floor_world = pred_world
     if pred_floor_world is not None and (floor_weight > 0 or floor_pen_weight > 0):
         pred_floor_j3d = endecoder.fk_v2(**_body_smpl_params(pred_floor_world))
@@ -1249,7 +1640,7 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
             extra_loss += floor_pen_loss * floor_pen_weight
             extra_loss_dict["floor_penetration_loss_ego"] = floor_pen_loss
 
-    ego_head_weight = weights.get("ego_head_trans", 0.0)
+    ego_head_weight = _loss_weight(weights, "wearer_head_trans", "ego_head_trans")
     if pred_world is not None and ego_head_weight > 0 and "ego_cond" in inputs:
         ego_cond = inputs["ego_cond"]
         if "T_world_head" in ego_cond:
@@ -1273,31 +1664,44 @@ def compute_extra_global_loss_ego(inputs, outputs, ppl):
             extra_loss += head_loss * ego_head_weight
             extra_loss_dict["ego_head_trans_loss"] = head_loss
 
-    static_weight = weights.get("static_conf_bce", 0.0)
-    foot_sliding_weight = weights.get("ego_foot_sliding", 0.0)
+    static_weight = _loss_weight(weights, "wearer_static_conf_bce", "static_conf_bce")
+    foot_sliding_weight = _loss_weight(weights, "wearer_foot_sliding", "ego_foot_sliding")
     if (static_weight > 0 and static_conf_logits_ego is not None) or (foot_sliding_weight > 0 and pred_world is not None):
         vel_thr = args.static_conf.vel_thr
         assert vel_thr > 0
-        joint_ids = [7, 10, 8, 11, 20, 21]
+        frame_dt = max(float(args.get("frame_dt", 0.033)), 1e-6)
+        foot_ids = torch.as_tensor(
+            args.get("floor_joint_ids", [7, 10, 8, 11]), device=gt_transl.device, dtype=torch.long
+        )
+        wrist_ids = torch.as_tensor([20, 21], device=gt_transl.device, dtype=torch.long)
         gt_w_j3d = endecoder.fk_v2(**_body_smpl_params(ego_targets["smpl_params_w"]))
         static_all = get_static_joint_mask(gt_w_j3d, vel_thr=vel_thr, repeat_last=True)
-        static_gt = static_all[:, :, joint_ids].float()
+        gt_foot_y = gt_w_j3d.index_select(-2, foot_ids)[..., 1]
+        valid_foot_y = gt_foot_y.masked_fill(~mask[..., None], torch.inf)
+        floor_y = valid_foot_y.amin(dim=(1, 2), keepdim=True)
+        fallback_floor_y = gt_foot_y.amin(dim=(1, 2), keepdim=True)
+        floor_y = torch.where(torch.isfinite(floor_y), floor_y, fallback_floor_y).detach()
+        contact_height_thr = float(args.get("foot_contact_height_thr", 0.08))
+        foot_contact = static_all.index_select(-1, foot_ids) & (gt_foot_y <= floor_y + contact_height_thr)
+        wrist_static = static_all.index_select(-1, wrist_ids)
+        static_gt = torch.cat([foot_contact, wrist_static], dim=-1).float()
 
         if static_weight > 0 and static_conf_logits_ego is not None:
             static_conf_loss = F.binary_cross_entropy_with_logits(static_conf_logits_ego, static_gt, reduction="none")
-            static_conf_loss = safe_masked_mean(static_conf_loss, mask[..., None])
+            static_mask = mask[..., None].expand_as(static_conf_loss)
+            static_conf_loss = (static_conf_loss * static_mask).sum() / static_mask.sum().clamp(min=1)
             extra_loss += static_conf_loss * static_weight
             extra_loss_dict["static_conf_loss_ego"] = static_conf_loss
+            extra_loss_dict["foot_contact_ratio_ego"] = foot_contact.float().mean().detach()
 
         if foot_sliding_weight > 0 and pred_world is not None and gt_w_j3d.size(1) > 1:
             pred_w_j3d = endecoder.fk_v2(**_body_smpl_params(pred_world))
-            foot_ids = torch.as_tensor(args.get("floor_joint_ids", [7, 10, 8, 11]), device=pred_w_j3d.device, dtype=torch.long)
             pred_foot = pred_w_j3d.index_select(-2, foot_ids)
-            foot_vel = pred_foot[:, 1:] - pred_foot[:, :-1]
-            contact = static_all.index_select(-1, foot_ids).float()
+            foot_vel_mps = (pred_foot[:, 1:] - pred_foot[:, :-1]) / frame_dt
+            contact = foot_contact.float()
             contact_pair = contact[:, 1:] * contact[:, :-1]
             foot_mask = (mask[:, 1:] & mask[:, :-1]).float()[..., None]
-            foot_sliding_loss = foot_vel.norm(dim=-1) * contact_pair * foot_mask
+            foot_sliding_loss = foot_vel_mps.norm(dim=-1) * contact_pair * foot_mask
             denom = (contact_pair * foot_mask).sum().clamp(min=1.0)
             foot_sliding_loss = foot_sliding_loss.sum() / denom
             extra_loss += foot_sliding_loss * foot_sliding_weight
@@ -1326,21 +1730,21 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
     # prediction
     pred_c_j3d = endecoder.fk_v2(**_body_smpl_params(pred_smpl_params))
     pred_cr_j3d = pred_c_j3d - pred_c_j3d[:, :, :1]  # (B, L, J, 3)
-    if torch.isnan(pred_c_j3d).any() or torch.isinf(pred_c_j3d).any():
-        Log.warning("NaN/Inf in pred_c_j3d!")
     # gt
     gt_c_j3d = endecoder.fk_v2(**_body_smpl_params(inputs["interactee_smpl_params_c"]))  # (B, L, J, 3)
     gt_cr_j3d = gt_c_j3d - gt_c_j3d[:, :, :1]  # (B, L, J, 3)
 
     # Root aligned C-MPJPE Loss
-    if weights.cr_j3d > 0.0:
+    cr_j3d_weight = _loss_weight(weights, "partner_cr_j3d", "cr_j3d")
+    if cr_j3d_weight > 0.0:
         cr_j3d_loss = F.mse_loss(pred_cr_j3d, gt_cr_j3d, reduction="none")
         cr_j3d_loss = safe_masked_mean(cr_j3d_loss, mask[..., None, None])
-        extra_loss += cr_j3d_loss * weights.cr_j3d
+        extra_loss += cr_j3d_loss * cr_j3d_weight
         extra_loss_dict["cr_j3d_loss"] = cr_j3d_loss
 
     # Reprojection (to align with image)
-    if weights.transl_c > 0.0:
+    transl_c_weight = _loss_weight(weights, "partner_transl_c", "transl_c")
+    if transl_c_weight > 0.0:
         # pred_transl = decode_dict["transl"]  # (B, L, 3)
         # gt_transl = inputs["smpl_params_c"]["transl"]
         # transl_c_loss = F.l1_loss(pred_transl, gt_transl, reduction="none")
@@ -1368,9 +1772,10 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
         transl_c_loss = safe_masked_mean(transl_c_loss, mask[..., None] * valid_mask)
 
         extra_loss_dict["transl_c_loss"] = transl_c_loss
-        extra_loss += transl_c_loss * weights.transl_c
+        extra_loss += transl_c_loss * transl_c_weight
 
-    if weights.j2d > 0.0:
+    j2d_weight = _loss_weight(weights, "partner_j2d", "j2d")
+    if j2d_weight > 0.0:
         # prevent divide 0 or small value to overflow(fp16)
         reproj_z_thr = 0.3
         pred_c_j3d_z0_mask = pred_c_j3d[..., 2].abs() <= reproj_z_thr
@@ -1391,12 +1796,16 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
         )[..., None]
         valid_mask[~mask_reproj] = False  # Do not supervise on 3dpw
         j2d_loss = F.mse_loss(pred_j2d_01, gt_j2d_01, reduction="none")
+        vis_weight = _frame_visibility_weight_from_kp2d(inputs.get("kp2d", None), j2d_loss.ndim)
+        if vis_weight is not None:
+            valid_mask = valid_mask * vis_weight
         j2d_loss = safe_masked_mean(j2d_loss, mask[..., None, None] * valid_mask)
 
-        extra_loss += j2d_loss * weights.j2d
+        extra_loss += j2d_loss * j2d_weight
         extra_loss_dict["j2d_loss"] = j2d_loss
 
-    if weights.cr_verts > 0:
+    cr_verts_weight = _loss_weight(weights, "partner_cr_verts", "cr_verts")
+    if cr_verts_weight > 0:
         # SMPL forward
         pred_c_verts437, pred_c_j17 = endecoder.smplx_model(**_body_smpl_params(pred_smpl_params))
         root_ = pred_c_j17[:, :, [11, 12], :].mean(-2, keepdim=True)
@@ -1405,10 +1814,11 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
         gt_cr_verts437 = inputs["gt_cr_verts437"]  # (B, L, 437, 3)
         cr_vert_loss = F.mse_loss(pred_cr_verts437, gt_cr_verts437, reduction="none")
         cr_vert_loss = safe_masked_mean(cr_vert_loss, mask[:, :, None, None])
-        extra_loss += cr_vert_loss * weights.cr_verts
+        extra_loss += cr_vert_loss * cr_verts_weight
         extra_loss_dict["cr_vert_loss"] = cr_vert_loss
 
-    if weights.verts2d > 0:
+    verts2d_weight = _loss_weight(weights, "partner_verts2d", "verts2d")
+    if verts2d_weight > 0:
         gt_c_verts437 = inputs["gt_c_verts437"]  # (B, L, 437, 3)
 
         # prevent divide 0 or small value to overflow(fp16)
@@ -1433,7 +1843,7 @@ def compute_extra_incam_loss(inputs, outputs, ppl):
         verts2d_loss = F.mse_loss(pred_verts2d_01, gt_verts2d_01, reduction="none")
         verts2d_loss = safe_masked_mean(verts2d_loss, mask[..., None, None] * valid_mask)
 
-        extra_loss += verts2d_loss * weights.verts2d
+        extra_loss += verts2d_loss * verts2d_weight
         extra_loss_dict["verts2d_loss"] = verts2d_loss
 
     return extra_loss, extra_loss_dict
@@ -1454,7 +1864,8 @@ def compute_extra_global_loss(inputs, outputs, ppl):
     model_output = outputs["model_output"]
     static_conf_logits = model_output["static_conf_logits"]
 
-    if weights.transl_w > 0:
+    transl_w_weight = _loss_weight(weights, "partner_transl_w", "transl_w")
+    if transl_w_weight > 0:
         gt_transl_w = inputs["interactee_smpl_params_w"]["transl"]
         loss_mode = args.get("exo_world_loss_mode", "rollout_gt_init")
         if loss_mode == "incam_kinect":
@@ -1472,11 +1883,12 @@ def compute_extra_global_loss(inputs, outputs, ppl):
 
         trans_w_loss = F.l1_loss(pred_transl_w, gt_transl_w, reduction="none")
         trans_w_loss = safe_masked_mean(trans_w_loss, mask[..., None])
-        extra_loss += trans_w_loss * weights.transl_w
+        extra_loss += trans_w_loss * transl_w_weight
         extra_loss_dict["transl_w_loss"] = trans_w_loss
 
     # Static-Conf loss
-    if weights.static_conf_bce > 0:
+    static_conf_weight = _loss_weight(weights, "partner_static_conf_bce", "static_conf_bce")
+    if static_conf_weight > 0:
         # Compute gt by thresholding velocity
         vel_thr = args.static_conf.vel_thr
         assert vel_thr > 0
@@ -1488,7 +1900,7 @@ def compute_extra_global_loss(inputs, outputs, ppl):
 
         static_conf_loss = F.binary_cross_entropy_with_logits(pred_static_conf_logits, static_gt, reduction="none")
         static_conf_loss = safe_masked_mean(static_conf_loss, mask[..., None])
-        extra_loss += static_conf_loss * weights.static_conf_bce
+        extra_loss += static_conf_loss * static_conf_weight
         extra_loss_dict["static_conf_loss"] = static_conf_loss
 
     return extra_loss, extra_loss_dict

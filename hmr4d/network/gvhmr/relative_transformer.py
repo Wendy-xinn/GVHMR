@@ -30,6 +30,9 @@ class NetworkEncoderRoPE(nn.Module):
         interaction_dim=0,
         cross_view_fusion=False,
         cross_view_heads=4,
+        cross_extrinsic_dim=9,
+        cross_local_radius=4,
+        cross_teacher_mvp=False,
         # intermediate
         latent_dim=512,
         num_layers=12,
@@ -63,6 +66,9 @@ class NetworkEncoderRoPE(nn.Module):
         self.interaction_dim = interaction_dim
         self.cross_view_fusion = cross_view_fusion
         self.cross_view_heads = cross_view_heads
+        self.cross_extrinsic_dim = cross_extrinsic_dim
+        self.cross_local_radius = int(cross_local_radius)
+        self.cross_teacher_mvp = bool(cross_teacher_mvp)
 
         # intermediate
         self.latent_dim = latent_dim
@@ -115,15 +121,36 @@ class NetworkEncoderRoPE(nn.Module):
                 self.static_conf_head_ego = Mlp(self.latent_dim, out_features=static_conf_dim)
 
         if self.cross_view_fusion:
-            self.cross_q_norm = nn.LayerNorm(self.latent_dim)
-            self.cross_kv_norm = nn.LayerNorm(self.latent_dim)
-            self.cross_attn = nn.MultiheadAttention(
-                self.latent_dim,
-                num_heads=self.cross_view_heads,
-                dropout=dropout,
-                batch_first=True,
+            self.partner_cross_q_norm = nn.LayerNorm(self.latent_dim)
+            self.partner_cross_kv_norm = nn.LayerNorm(self.latent_dim)
+            self.wearer_cross_q_norm = nn.LayerNorm(self.latent_dim)
+            self.wearer_cross_kv_norm = nn.LayerNorm(self.latent_dim)
+            self.partner_cross_attn = nn.MultiheadAttention(
+                self.latent_dim, num_heads=self.cross_view_heads, dropout=dropout, batch_first=True
             )
-            self.cross_gate = nn.Parameter(torch.zeros(()))
+            self.wearer_cross_attn = nn.MultiheadAttention(
+                self.latent_dim, num_heads=self.cross_view_heads, dropout=dropout, batch_first=True
+            )
+            self.partner_cross_gate = Mlp(self.latent_dim * 2, hidden_features=self.latent_dim, out_features=1)
+            self.wearer_cross_gate = Mlp(self.latent_dim * 2, hidden_features=self.latent_dim, out_features=1)
+            nn.init.zeros_(self.partner_cross_gate.fc2.weight)
+            nn.init.zeros_(self.partner_cross_gate.fc2.bias)
+            nn.init.zeros_(self.wearer_cross_gate.fc2.weight)
+            nn.init.constant_(self.wearer_cross_gate.fc2.bias, 1.3862944)  # sigmoid -> 0.8
+            self.partner_source_proj = zero_module(nn.Linear(self.latent_dim, self.latent_dim))
+            self.wearer_source_proj = zero_module(nn.Linear(self.latent_dim, self.latent_dim))
+            self.partner_teacher_norm = nn.LayerNorm(self.latent_dim)
+            self.wearer_teacher_norm = nn.LayerNorm(self.latent_dim)
+            self.cross_interactee_type = nn.Parameter(torch.randn(1, 1, self.latent_dim) * 0.02)
+            self.cross_wearer_type = nn.Parameter(torch.randn(1, 1, self.latent_dim) * 0.02)
+            if self.cross_teacher_mvp:
+                # 21 local joint delta rotations + root delta rotation + root delta translation.
+                self.teacher_partner_residual_head = Mlp(self.latent_dim, out_features=69)
+                self.teacher_wearer_residual_head = Mlp(self.latent_dim, out_features=69)
+                nn.init.zeros_(self.teacher_partner_residual_head.fc2.weight)
+                nn.init.zeros_(self.teacher_partner_residual_head.fc2.bias)
+                nn.init.zeros_(self.teacher_wearer_residual_head.fc2.weight)
+                nn.init.zeros_(self.teacher_wearer_residual_head.fc2.bias)
 
 
     def _build_condition_embedder(self):
@@ -190,6 +217,14 @@ class NetworkEncoderRoPE(nn.Module):
                 nn.Dropout(dropout),
                 zero_module(nn.Linear(latent_dim, latent_dim)),
             )
+        if self.cross_extrinsic_dim > 0:
+            self.cross_extrinsic_embedder = nn.Sequential(
+                nn.LayerNorm(self.cross_extrinsic_dim),
+                nn.Linear(self.cross_extrinsic_dim, latent_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                zero_module(nn.Linear(latent_dim, latent_dim)),
+            )
 
     def forward(
         self,
@@ -204,13 +239,23 @@ class NetworkEncoderRoPE(nn.Module):
         f_ego_head=None,
         f_ego_hand=None,
         f_interaction=None,
-        cross_obs=None,
-        cross_f_cliffcam=None,
-        cross_f_cam_angvel=None,
-        cross_f_cam_trans_vel=None,
-        cross_f_gravity_dir=None,
-        cross_f_imgseq=None,
-        cross_f_ego_imgseq=None,
+        cross_interactee_obs=None,
+        cross_interactee_f_cliffcam=None,
+        cross_interactee_f_cam_angvel=None,
+        cross_interactee_f_cam_trans_vel=None,
+        cross_interactee_f_gravity_dir=None,
+        cross_interactee_f_imgseq=None,
+        cross_interactee_f_extrinsic=None,
+        cross_interactee_key_padding_mask=None,
+        cross_wearer_obs=None,
+        cross_wearer_f_cliffcam=None,
+        cross_wearer_f_cam_angvel=None,
+        cross_wearer_f_cam_trans_vel=None,
+        cross_wearer_f_gravity_dir=None,
+        cross_wearer_f_imgseq=None,
+        cross_wearer_f_extrinsic=None,
+        cross_wearer_key_padding_mask=None,
+        ego_partner_visibility=None,
     ):
         """
         Args:
@@ -242,6 +287,7 @@ class NetworkEncoderRoPE(nn.Module):
             f_ego_head_=None,
             f_ego_hand_=None,
             f_interaction_=None,
+            f_cross_extrinsic_=None,
         ):
             obs_ = obs_.clone()
             visible_mask = obs_[..., [2]] > 0.5
@@ -267,12 +313,14 @@ class NetworkEncoderRoPE(nn.Module):
                 f_to_add_.append(self.ego_hand_embedder(f_ego_hand_))
             if f_interaction_ is not None and hasattr(self, "interaction_embedder"):
                 f_to_add_.append(self.interaction_embedder(f_interaction_))
+            if f_cross_extrinsic_ is not None and hasattr(self, "cross_extrinsic_embedder"):
+                f_to_add_.append(self.cross_extrinsic_embedder(f_cross_extrinsic_))
 
             for f_delta in f_to_add_:
                 x_ = x_ + f_delta
             return x_
 
-        x = encode_stream(
+        x_partner = encode_stream(
             obs,
             f_cliffcam,
             f_cam_angvel,
@@ -284,22 +332,49 @@ class NetworkEncoderRoPE(nn.Module):
             f_ego_hand,
             f_interaction,
         )
+        x = x_partner
+        x_ego_context = None
 
-        x_cross = None
-        if self.cross_view_fusion and cross_obs is not None:
-            x_cross = encode_stream(
-                cross_obs,
-                cross_f_cliffcam if cross_f_cliffcam is not None else f_cliffcam,
-                cross_f_cam_angvel if cross_f_cam_angvel is not None else f_cam_angvel,
-                cross_f_cam_trans_vel,
-                cross_f_gravity_dir,
-                cross_f_imgseq,
-                cross_f_ego_imgseq,
-            )
+        x_interactee_src = None
+        x_wearer_src = None
+        partner_gate = None
+        wearer_gate = None
+        if self.cross_view_fusion:
+            if cross_interactee_obs is not None:
+                x_interactee_src = encode_stream(
+                    cross_interactee_obs,
+                    cross_interactee_f_cliffcam,
+                    cross_interactee_f_cam_angvel,
+                    cross_interactee_f_cam_trans_vel,
+                    cross_interactee_f_gravity_dir,
+                    cross_interactee_f_imgseq,
+                    f_cross_extrinsic_=cross_interactee_f_extrinsic,
+                ) + self.cross_interactee_type
+            if cross_wearer_obs is not None:
+                x_wearer_src = encode_stream(
+                    cross_wearer_obs,
+                    cross_wearer_f_cliffcam,
+                    cross_wearer_f_cam_angvel,
+                    cross_wearer_f_cam_trans_vel,
+                    cross_wearer_f_gravity_dir,
+                    cross_wearer_f_imgseq,
+                    f_cross_extrinsic_=cross_wearer_f_extrinsic,
+                ) + self.cross_wearer_type
 
         # Setup length and make padding mask
         assert B == length.size(0)
         pmask = ~length_to_mask(length, L)  # (B, L)
+
+        def prepare_source_pmask(mask):
+            source_pmask = pmask if mask is None else pmask | mask.to(device=x.device, dtype=torch.bool)
+            source_available = (~source_pmask).any(dim=1)
+            # An unavailable source is ignored after attention, but every local-attention
+            # query still needs at least one unmasked key to keep softmax finite.
+            safe_pmask = torch.where(source_available[:, None], source_pmask, pmask)
+            return safe_pmask, source_available
+
+        pmask_interactee, interactee_available = prepare_source_pmask(cross_interactee_key_padding_mask)
+        pmask_wearer, wearer_available = prepare_source_pmask(cross_wearer_key_padding_mask)
 
         if L > self.max_len:
             attnmask = torch.ones((L, L), device=x.device, dtype=torch.bool)
@@ -312,21 +387,113 @@ class NetworkEncoderRoPE(nn.Module):
         else:
             attnmask = None
 
-        # Transformer
-        if x_cross is not None:
-            x_cat = torch.cat([x, x_cross], dim=0)
-            pmask_cat = torch.cat([pmask, pmask], dim=0)
+        if x_interactee_src is not None or x_wearer_src is not None:
+            wearer_obs = obs.new_zeros(obs.shape)
+            wearer_cliffcam = f_cliffcam.new_zeros(f_cliffcam.shape)
+            x_wearer_tgt = encode_stream(
+                wearer_obs,
+                wearer_cliffcam,
+                f_cam_angvel,
+                f_cam_trans_vel,
+                f_gravity_dir,
+                None,
+                None,
+                f_ego_head,
+                f_ego_hand,
+                None,
+            )
+
+            streams = [x_partner, x_wearer_tgt]
+            stream_pmasks = [pmask, pmask]
+            if x_interactee_src is not None:
+                streams.append(x_interactee_src)
+                stream_pmasks.append(pmask_interactee)
+            if x_wearer_src is not None:
+                streams.append(x_wearer_src)
+                stream_pmasks.append(pmask_wearer)
+
+            x_cat = torch.cat(streams, dim=0)
+            pmask_cat = torch.cat(stream_pmasks, dim=0)
             for block in self.blocks:
                 x_cat = block(x_cat, attn_mask=attnmask, tgt_key_padding_mask=pmask_cat)
-            x, x_cross = x_cat[:B], x_cat[B:]
-            cross_delta, _ = self.cross_attn(
-                self.cross_q_norm(x),
-                self.cross_kv_norm(x_cross),
-                self.cross_kv_norm(x_cross),
-                key_padding_mask=pmask,
-                need_weights=False,
-            )
-            x = x + self.cross_gate * cross_delta
+            encoded = list(x_cat.chunk(len(streams), dim=0))
+            x_partner = encoded.pop(0)
+            x_wearer_tgt = encoded.pop(0)
+            local_attn_mask = None
+            if self.cross_local_radius >= 0:
+                frame_ids = torch.arange(L, device=x.device)
+                local_attn_mask = (frame_ids[:, None] - frame_ids[None, :]).abs() > self.cross_local_radius
+
+            def run_local_cross_attention(attn, q_norm, kv_norm, query, source, source_pmask):
+                """Attend to valid local source frames without creating all-masked softmax rows."""
+                source_valid = ~source_pmask
+                source_for_attn = source * source_valid[..., None].to(source.dtype)
+                if local_attn_mask is None:
+                    local_available = source_valid.any(dim=1, keepdim=True).expand(-1, L)
+                else:
+                    local_available = (
+                        source_valid[:, None, :] & ~local_attn_mask[None, :, :]
+                    ).any(dim=-1)
+                delta, _ = attn(
+                    q_norm(query),
+                    kv_norm(source_for_attn),
+                    kv_norm(source_for_attn),
+                    attn_mask=local_attn_mask,
+                    need_weights=False,
+                )
+                delta = delta * local_available[..., None].to(delta.dtype)
+                return delta, local_available
+
+            partner_gate = None
+            wearer_gate = None
+            if x_interactee_src is not None:
+                x_interactee_src = encoded.pop(0)
+                partner_delta, partner_local_available = run_local_cross_attention(
+                    self.partner_cross_attn,
+                    self.partner_cross_q_norm,
+                    self.partner_cross_kv_norm,
+                    x_partner,
+                    x_interactee_src,
+                    pmask_interactee,
+                )
+                partner_local_available = partner_local_available & interactee_available[:, None]
+                partner_available_f = partner_local_available[..., None].to(partner_delta.dtype)
+                partner_delta = partner_delta * partner_available_f
+                partner_gate = torch.sigmoid(self.partner_cross_gate(torch.cat([x_partner, partner_delta], dim=-1)))
+                if ego_partner_visibility is not None:
+                    visibility = ego_partner_visibility.to(device=x.device, dtype=x_partner.dtype).clamp(0.0, 1.0)
+                    if visibility.ndim == 2:
+                        visibility = visibility[..., None]
+                    # Low target-view visibility deterministically increases reliance on complete exo evidence.
+                    partner_gate = partner_gate + (1.0 - visibility) * (1.0 - partner_gate)
+                partner_gate = partner_gate * partner_available_f
+                aligned_source = self.partner_source_proj(x_interactee_src)
+                aligned_source = aligned_source * (~pmask_interactee)[..., None].to(aligned_source.dtype)
+                aligned_source = aligned_source * partner_available_f
+                x_partner = self.partner_teacher_norm(x_partner + partner_gate * partner_delta + aligned_source)
+
+            if x_wearer_src is not None:
+                x_wearer_src = encoded.pop(0)
+                wearer_delta, wearer_local_available = run_local_cross_attention(
+                    self.wearer_cross_attn,
+                    self.wearer_cross_q_norm,
+                    self.wearer_cross_kv_norm,
+                    x_wearer_tgt,
+                    x_wearer_src,
+                    pmask_wearer,
+                )
+                wearer_local_available = wearer_local_available & wearer_available[:, None]
+                wearer_available_f = wearer_local_available[..., None].to(wearer_delta.dtype)
+                wearer_delta = wearer_delta * wearer_available_f
+                wearer_gate = torch.sigmoid(self.wearer_cross_gate(torch.cat([x_wearer_tgt, wearer_delta], dim=-1)))
+                wearer_gate = wearer_gate * wearer_available_f
+                aligned_source = self.wearer_source_proj(x_wearer_src)
+                aligned_source = aligned_source * (~pmask_wearer)[..., None].to(aligned_source.dtype)
+                aligned_source = aligned_source * wearer_available_f
+                x_wearer_tgt = self.wearer_teacher_norm(x_wearer_tgt + wearer_gate * wearer_delta + aligned_source)
+
+            x = x_partner
+            x_ego_context = x_wearer_tgt
         else:
             for block in self.blocks:
                 x = block(x, attn_mask=attnmask, tgt_key_padding_mask=pmask)
@@ -338,12 +505,38 @@ class NetworkEncoderRoPE(nn.Module):
             betas = repeat(betas, "b c -> b l c", l=L)
             sample = torch.cat([sample[..., :126], betas, sample[..., 136:]], dim=-1)
         sample_ego = None
+        ego_context = x_ego_context if x_ego_context is not None else x
         if self.dual_head and self.final_layer_ego is not None:
-            sample_ego = self.final_layer_ego(x)
+            sample_ego = self.final_layer_ego(ego_context)
             if self.avgbeta and sample_ego.size(-1) >= 136:
                 betas = (sample_ego[..., 126:136] * (~pmask[..., None])).sum(1) / length[:, None]  # (B, C)
                 betas = repeat(betas, "b c -> b l c", l=L)
                 sample_ego = torch.cat([sample_ego[..., :126], betas, sample_ego[..., 136:]], dim=-1)
+        source_base = {}
+        if self.cross_teacher_mvp:
+            for source_name, source_context in (("partner", x_interactee_src), ("wearer", x_wearer_src)):
+                if source_context is None:
+                    continue
+                source_x = self.final_layer(source_context)
+                if self.avgbeta:
+                    source_mask = pmask_interactee if source_name == "partner" else pmask_wearer
+                    source_length = (~source_mask).sum(1).clamp_min(1)
+                    source_betas = (source_x[..., 126:136] * (~source_mask[..., None])).sum(1) / source_length[:, None]
+                    source_x = torch.cat([source_x[..., :126], repeat(source_betas, "b c -> b l c", l=L), source_x[..., 136:]], dim=-1)
+                source_cam = self.pred_cam_head(source_context) if self.pred_cam_head else None
+                if source_cam is not None:
+                    source_cam = source_cam * self.pred_cam_std + self.pred_cam_mean
+                    source_cam[..., 0].clamp_min_(0.25)
+                source_static = self.static_conf_head(source_context) if self.static_conf_head else None
+                residual_head = self.teacher_partner_residual_head if source_name == "partner" else self.teacher_wearer_residual_head
+                target_context = x_partner if source_name == "partner" else x_wearer_tgt
+                source_base[source_name] = {
+                    "pred_x": source_x,
+                    "pred_cam": source_cam,
+                    "static_conf_logits": source_static,
+                    "residual": residual_head(target_context),
+                }
+
         # Output (extra)
         pred_cam = None
         if self.pred_cam_head:
@@ -352,7 +545,7 @@ class NetworkEncoderRoPE(nn.Module):
             torch.clamp_min_(pred_cam[..., 0], 0.25)  # min_clamp s to 0.25 (prevent negative prediction)
         pred_cam_ego = None
         if self.pred_cam_head_ego is not None:
-            pred_cam_ego = self.pred_cam_head_ego(x)
+            pred_cam_ego = self.pred_cam_head_ego(ego_context)
             pred_cam_ego = pred_cam_ego * self.pred_cam_std + self.pred_cam_mean
             torch.clamp_min_(pred_cam_ego[..., 0], 0.25)
 
@@ -361,13 +554,17 @@ class NetworkEncoderRoPE(nn.Module):
             static_conf_logits = self.static_conf_head(x)  # (B, L, C')
         static_conf_logits_ego = None
         if self.static_conf_head_ego is not None:
-            static_conf_logits_ego = self.static_conf_head_ego(x)
+            static_conf_logits_ego = self.static_conf_head_ego(ego_context)
 
         output = {
             "pred_context": x,
+            "pred_context_ego": ego_context,
             "pred_x": sample,
             "pred_cam": pred_cam,
             "static_conf_logits": static_conf_logits,
+            "cross_partner_gate": partner_gate,
+            "cross_wearer_gate": wearer_gate,
+            "cross_source_base": source_base,
         }
         if sample_ego is not None:
             output.update(

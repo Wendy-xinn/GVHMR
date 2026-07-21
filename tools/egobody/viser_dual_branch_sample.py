@@ -209,8 +209,6 @@ def _add_camera_nodes(
     trajectory_color=None,
     line_width=3.0,
 ):
-    handles_by_t = []
-    F = T_world_cam_seq.shape[0]
     trajectory_color = trajectory_color or frustum_color
     cam_centers = T_world_cam_seq[:, :3, 3]
     server.scene.add_spline_catmull_rom(
@@ -219,77 +217,70 @@ def _add_camera_nodes(
         line_width=max(2.0, line_width),
         color=trajectory_color,
     )
-    for t in range(F):
-        handles = []
-        visible = t == 0
+    frustum_edges = [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (2, 3), (3, 4), (4, 1)]
+    axis_specs = [
+        ("forward", 0, 5, (20, 210, 255)),
+        ("up", 0, 6, (60, 220, 60)),
+        ("right", 0, 7, (255, 80, 40)),
+    ]
+    pts0 = _camera_frustum_points(T_world_cam_seq[0], scale=0.24)
+    edge_handles = [
+        server.scene.add_spline_catmull_rom(
+            f"/{prefix}/{node_name}/frustum_{i}",
+            _to_numpy(torch.stack([pts0[a], pts0[b]], dim=0)),
+            line_width=line_width,
+            color=frustum_color,
+        )
+        for i, (a, b) in enumerate(frustum_edges)
+    ]
+    axis_handles = [
+        server.scene.add_spline_catmull_rom(
+            f"/{prefix}/{node_name}/{name}",
+            _to_numpy(torch.stack([pts0[a], pts0[b]], dim=0)),
+            line_width=line_width + 1.0,
+            color=color,
+        )
+        for name, a, b, color in axis_specs
+    ]
+    center_handle = server.scene.add_point_cloud(
+        f"/{prefix}/{node_name}/center",
+        points=_to_numpy(T_world_cam_seq[0, :3, 3][None]),
+        colors=np.array([frustum_color], dtype=np.uint8),
+        point_size=0.055,
+        point_shape="circle",
+    )
+    cpf_link_handle = None
+    cpf_marker_handle = None
+    if T_world_cpf_seq is not None:
+        cpf_link_handle = server.scene.add_spline_catmull_rom(
+            f"/{prefix}/{node_name}/to_virtual_cpf",
+            _to_numpy(torch.stack([T_world_cam_seq[0, :3, 3], T_world_cpf_seq[0, :3, 3]], dim=0)),
+            line_width=4.0,
+            color=(255, 190, 30),
+        )
+        cpf_marker_handle = server.scene.add_point_cloud(
+            f"/{prefix}/{node_name}/virtual_cpf_marker",
+            points=_to_numpy(T_world_cpf_seq[0, :3, 3][None]),
+            colors=np.array([[255, 190, 30]], dtype=np.uint8),
+            point_size=0.06,
+            point_shape="circle",
+        )
+
+    def update(t):
+        t = min(int(t), T_world_cam_seq.shape[0] - 1)
         T_cam = T_world_cam_seq[t]
         pts = _camera_frustum_points(T_cam, scale=0.24)
-        frustum_edges = [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (2, 3), (3, 4), (4, 1)]
-        for i, (a, b) in enumerate(frustum_edges):
-            handles.append(
-                server.scene.add_spline_catmull_rom(
-                    f"/{prefix}/t{t}/{node_name}/frustum_{i}",
-                    _to_numpy(torch.stack([pts[a], pts[b]], dim=0)),
-                    line_width=line_width,
-                    color=frustum_color,
-                    visible=visible,
-                )
-            )
-        axis_specs = [
-            ("forward", 0, 5, (20, 210, 255)),
-            ("up", 0, 6, (60, 220, 60)),
-            ("right", 0, 7, (255, 80, 40)),
-        ]
-        for name, a, b, color in axis_specs:
-            handles.append(
-                server.scene.add_spline_catmull_rom(
-                    f"/{prefix}/t{t}/{node_name}/{name}",
-                    _to_numpy(torch.stack([pts[a], pts[b]], dim=0)),
-                    line_width=line_width + 1.0,
-                    color=color,
-                    visible=visible,
-                )
-            )
-        handles.append(
-            server.scene.add_point_cloud(
-                f"/{prefix}/t{t}/{node_name}/center",
-                points=_to_numpy(T_cam[:3, 3][None]),
-                colors=np.array([frustum_color], dtype=np.uint8),
-                point_size=0.055,
-                point_shape="circle",
-                visible=visible,
-            )
-        )
+        for handle, (a, b) in zip(edge_handles, frustum_edges):
+            handle.points = _to_numpy(torch.stack([pts[a], pts[b]], dim=0))
+        for handle, (_name, a, b, _color) in zip(axis_handles, axis_specs):
+            handle.points = _to_numpy(torch.stack([pts[a], pts[b]], dim=0))
+        center_handle.points = _to_numpy(T_cam[:3, 3][None])
         if T_world_cpf_seq is not None:
-            T_cpf = T_world_cpf_seq[t]
-            handles.append(
-                server.scene.add_spline_catmull_rom(
-                    f"/{prefix}/t{t}/{node_name}_to_virtual_cpf",
-                    _to_numpy(torch.stack([T_cam[:3, 3], T_cpf[:3, 3]], dim=0)),
-                    line_width=4.0,
-                    color=(255, 190, 30),
-                    visible=visible,
-                )
-            )
-            handles.append(
-                server.scene.add_point_cloud(
-                    f"/{prefix}/t{t}/{node_name}/virtual_cpf_marker",
-                    points=_to_numpy(T_cpf[:3, 3][None]),
-                    colors=np.array([[255, 190, 30]], dtype=np.uint8),
-                    point_size=0.06,
-                    point_shape="circle",
-                    visible=visible,
-                )
-            )
-        handles_by_t.append(handles)
-    return handles_by_t
+            T_cpf = T_world_cpf_seq[min(t, T_world_cpf_seq.shape[0] - 1)]
+            cpf_link_handle.points = _to_numpy(torch.stack([T_cam[:3, 3], T_cpf[:3, 3]], dim=0))
+            cpf_marker_handle.points = _to_numpy(T_cpf[:3, 3][None])
 
-
-def _set_visible(handles_by_t, t):
-    for i, handles in enumerate(handles_by_t):
-        visible = i == t
-        for h in handles:
-            h.visible = visible
+    return update
 
 
 def _render_client_frame(client, height, width):
@@ -315,12 +306,24 @@ def _render_client_frame(client, height, width):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", default="outputs/egobody_egoexo_v1/egobody_egoexo_stage2_both_continue/checkpoints/e099-s004900.ckpt")
-    parser.add_argument("--exp", default="gvhmr/egobody_egoexo_stage2_both")
-    parser.add_argument("--data-root", default="/public/home/wenxin/GVHMR/data")
+    parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--exp", default="gvhmr/egobody_egoexo_cross_teacher")
+    parser.add_argument("--data-root", default=str(REPO_ROOT / "data"))
     parser.add_argument("--split", default="test")
     parser.add_argument("--sample-idx", type=int, default=0)
-    parser.add_argument("--input-role", choices=("exo", "ego"), default="exo")
+    parser.add_argument("--input-role", choices=("exo", "ego"), default="ego")
+    parser.add_argument(
+        "--teacher-output-mode",
+        choices=("final", "exo-base", "target-only"),
+        default="final",
+        help="Render the final privileged teacher, its exo base, or the internal target-only diagnostic head.",
+    )
+    parser.add_argument(
+        "--ego-condition-mode",
+        choices=("full", "no-visual", "no-motion", "none"),
+        default="full",
+        help="Ablate ego network conditions while preserving exo evidence and coordinate transforms.",
+    )
     parser.add_argument("--motion-frames", type=int, default=128)
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--host", default="0.0.0.0")
@@ -349,12 +352,16 @@ def main():
     config_dir = str((Path(__file__).resolve().parents[2] / "hmr4d" / "configs").resolve())
     with hydra.initialize_config_dir(version_base="1.3", config_dir=config_dir):
         cfg = hydra.compose(config_name="train", overrides=[f"exp={args.exp}"])
+    if cfg.pipeline.args.get("use_cross_view_teacher", False) and args.input_role != "ego":
+        print("[WARN] cross-view teacher fusion is only active with --input-role ego; exo mode is a baseline comparison.")
     with open_dict(cfg.pipeline.args):
         cfg.pipeline.args.branch_mode = "both"
         cfg.pipeline.args.input_role = args.input_role
         cfg.pipeline.args.supervise_role = "none"
         cfg.pipeline.args.add_other_role_image_condition = False
         cfg.pipeline.args.enable_frozen_ego_image_exo = False
+        cfg.pipeline.args.cross_view_force_no_source = args.teacher_output_mode == "target-only"
+        cfg.pipeline.args.cross_view_ego_condition_ablation = args.ego_condition_mode
         cfg.pipeline.args.virtual_ego_from_exo = {
             "enabled": args.input_role == "exo",
             "mode": "fixed_observer",
@@ -390,9 +397,14 @@ def main():
         marker_ego_cond = _make_cam_angvel_cpf_ego_cond(eval_batch, marker_base_ego_cond, cfg.pipeline.args.virtual_ego_from_exo)
         exo_gt_params = outputs.get("exo_gt_smpl_params_w_aligned", batch["exo"]["smpl_params_w"])
         ego_gt_params = outputs.get("ego_gt_smpl_params_w_aligned", batch["ego"]["smpl_params_w"])
-        exo_pred_params = outputs.get("pred_smpl_params_kinect_from_incam")
-        ego_pred_direct_params = outputs.get("pred_smpl_params_global_ego_coarse", outputs.get("pred_smpl_params_global_ego"))
-        ego_pred_vel_params = outputs.get("pred_smpl_params_global_ego_vel", outputs.get("pred_smpl_params_global_ego"))
+        if args.teacher_output_mode == "exo-base":
+            exo_pred_params = outputs.get("exo_partner_base_motion")
+            ego_pred_direct_params = outputs.get("exo_wearer_base_motion")
+            ego_pred_vel_params = ego_pred_direct_params
+        else:
+            exo_pred_params = outputs.get("pred_smpl_params_kinect_from_incam")
+            ego_pred_direct_params = outputs.get("pred_smpl_params_global_ego_coarse", outputs.get("pred_smpl_params_global_ego"))
+            ego_pred_vel_params = outputs.get("pred_smpl_params_global_ego_vel", outputs.get("pred_smpl_params_global_ego"))
         ego_pred_params = ego_pred_vel_params if args.ego_pred_source == "vel" else ego_pred_direct_params
         if ego_pred_params is None:
             ego_pred_params = ego_pred_direct_params if args.ego_pred_source == "vel" else ego_pred_vel_params
@@ -445,6 +457,8 @@ def main():
         }
 
     debug_lines = [
+        f"teacher_output_mode: {args.teacher_output_mode}",
+        f"ego_condition_mode: {args.ego_condition_mode}",
         f"pred_x_ego_dim: {outputs.get('model_output', {}).get('pred_x_ego').shape[-1] if outputs.get('model_output', {}).get('pred_x_ego') is not None else 'missing'}",
         f"has_root_residual_vel_cpf: {'root_residual_vel_cpf' in ego_decode or 'local_transl_vel' in ego_decode}",
         _transl_motion_stats("ego_gt", ego_gt_params),
@@ -519,22 +533,18 @@ def main():
     server.scene.add_spline_catmull_rom("/world_axes/y_up", np.array([[0.0, 0.0, 0.0], [0.0, axis_len, 0.0]], dtype=np.float32), line_width=4.0, color=(60, 220, 60))
     server.scene.add_spline_catmull_rom("/world_axes/z_back", np.array([[0.0, 0.0, 0.0], [0.0, 0.0, axis_len]], dtype=np.float32), line_width=4.0, color=(80, 140, 255))
 
-    handles_by_t = [[] for _ in range(F)]
-    for t in range(F):
-        visible = t == 0
-        for name, verts, color in shifted_items:
-            fi = min(t, verts.shape[0] - 1)
-            handles_by_t[t].append(
-                server.scene.add_mesh_simple(
-                    f"/timesteps/{t}/{name}",
-                    vertices=verts[fi],
-                    faces=faces,
-                    color=color,
-                    visible=visible,
-                )
-            )
+    mesh_tracks = []
+    for name, verts, color in shifted_items:
+        handle = server.scene.add_mesh_simple(
+            f"/people/{name}",
+            vertices=verts[0],
+            faces=faces,
+            color=color,
+        )
+        mesh_tracks.append((handle, verts))
+    camera_updaters = []
     if gt_exo_cam is not None:
-        gt_exo_handles_by_t = _add_camera_nodes(
+        camera_updaters.append(_add_camera_nodes(
             server,
             "timesteps",
             gt_exo_cam,
@@ -543,11 +553,9 @@ def main():
             frustum_color=COLORS["gt_camera"],
             trajectory_color=COLORS["gt_camera"],
             line_width=2.0,
-        )
-        for t in range(F):
-            handles_by_t[t].extend(gt_exo_handles_by_t[t])
+        ))
     if gt_ego_pv_cam is not None:
-        gt_ego_pv_handles_by_t = _add_camera_nodes(
+        camera_updaters.append(_add_camera_nodes(
             server,
             "timesteps",
             gt_ego_pv_cam,
@@ -556,9 +564,7 @@ def main():
             frustum_color=COLORS["gt_ego_pv_camera"],
             trajectory_color=COLORS["gt_ego_pv_camera"],
             line_width=2.0,
-        )
-        for t in range(F):
-            handles_by_t[t].extend(gt_ego_pv_handles_by_t[t])
+        ))
 
     with server.gui.add_folder("Playback"):
         gui_timestep = server.gui.add_slider("Timestep", min=0, max=F - 1, step=1, initial_value=0)
@@ -609,6 +615,8 @@ def main():
             f"recording: `{meta.get('recording', '')}`  \n"
             f"window: `{meta.get('start', '')}-{meta.get('end', '')}`  \n"
             f"input_role: `{args.input_role}`  \n"
+            f"teacher_output_mode: `{args.teacher_output_mode}`  \n"
+            f"ego_condition_mode: `{args.ego_condition_mode}`  \n"
             f"ego_pred_source: `{args.ego_pred_source}`  \n"
             f"camera debug: `white=GT exo fixed camera, cyan=GT ego PV trajectory`  \n"
             + "  \n".join(f"`{line}`" for line in coord_lines)
@@ -620,7 +628,10 @@ def main():
         t = int(t)
         if t == state["last_t"]:
             return
-        _set_visible(handles_by_t, t)
+        for handle, verts in mesh_tracks:
+            handle.vertices = verts[min(t, verts.shape[0] - 1)]
+        for update_camera in camera_updaters:
+            update_camera(t)
         state["last_t"] = t
 
     @gui_timestep.on_update

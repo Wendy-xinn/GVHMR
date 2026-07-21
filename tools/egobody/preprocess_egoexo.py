@@ -572,6 +572,36 @@ def _update_cpf_only(args: argparse.Namespace) -> Path:
     return out_dir
 
 
+def _append_exo_wearer_features(args: argparse.Namespace) -> Path:
+    """Append HMR2 features for the camera wearer crop in the exo/Kinect view."""
+    recording = args.recording
+    out_dir = args.output_root / recording
+    wearer_path = out_dir / "features_exo_wearer_hmr2.pt"
+    manifest_path = out_dir / "manifest.pt"
+    if args.resume and wearer_path.exists():
+        print(f"[Skip] {recording}: existing exo wearer features found at {wearer_path}")
+        return out_dir
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing manifest.pt under {out_dir}")
+
+    manifest = torch.load(manifest_path, map_location="cpu")
+    if "bbx_ego_in_exo_gt" not in manifest:
+        raise KeyError("manifest['bbx_ego_in_exo_gt'] is required for exo wearer crop features")
+    kinect_paths = [Path(p) for p in manifest["kinect_img_paths"]]
+    exo_wearer_bbx = manifest["bbx_ego_in_exo_gt"].float()
+    extractor = Extractor(tqdm_leave=False)
+    exo_wearer_features = _extract_features_for_paths(
+        extractor, kinect_paths, exo_wearer_bbx, args.feature_chunk, "exo wearer HMR2 features"
+    )
+    _save(wearer_path, {"features": exo_wearer_features, "bbx_xys": exo_wearer_bbx, "image_paths": [str(p) for p in kinect_paths]})
+    L = int(manifest.get("length", exo_wearer_bbx.shape[0]))
+    manifest.setdefault("mask", {})["features_exo_wearer"] = torch.ones(L, dtype=torch.bool)
+    manifest.setdefault("files", {})["features_exo_wearer"] = "features_exo_wearer_hmr2.pt"
+    _save(manifest_path, manifest)
+    print(f"Saved {wearer_path}")
+    return out_dir
+
+
 def _append_ego_body_features(args: argparse.Namespace) -> Path:
     root = args.root
     recording = args.recording
@@ -764,6 +794,7 @@ def preprocess_recording(args: argparse.Namespace) -> Path:
     if args.resume and (out_dir / "manifest.pt").exists() and (out_dir / "smplx_gt.pt").exists() and (out_dir / "camera_head_traj.pt").exists():
         feature_ready = args.skip_features or (
             (out_dir / "features_exo_hmr2.pt").exists()
+            and (out_dir / "features_exo_wearer_hmr2.pt").exists()
             and (out_dir / "features_ego_full_hmr2.pt").exists()
             and (out_dir / "features_ego_body_hmr2.pt").exists()
         )
@@ -910,6 +941,7 @@ def preprocess_recording(args: argparse.Namespace) -> Path:
             "left_hand": camera_head_traj["left_hand_valid"],
             "right_hand": camera_head_traj["right_hand_valid"],
             "features_exo": torch.zeros(len(frame_ids), dtype=torch.bool),
+            "features_exo_wearer": torch.zeros(len(frame_ids), dtype=torch.bool),
             "features_ego_full": torch.zeros(len(frame_ids), dtype=torch.bool),
             "features_ego_body": torch.zeros(len(frame_ids), dtype=torch.bool),
             "ego_body_bbox": ego_body_bbox_valid,
@@ -918,6 +950,7 @@ def preprocess_recording(args: argparse.Namespace) -> Path:
             "smplx_gt": "smplx_gt.pt",
             "camera_head_traj": "camera_head_traj.pt",
             "features_exo": "features_exo_hmr2.pt",
+            "features_exo_wearer": "features_exo_wearer_hmr2.pt",
             "features_ego_full": "features_ego_full_hmr2.pt",
             "features_ego_body": "features_ego_body_hmr2.pt",
         },
@@ -946,9 +979,12 @@ def preprocess_recording(args: argparse.Namespace) -> Path:
 
     if not args.skip_features:
         extractor = Extractor(tqdm_leave=False)
-        exo_features = _extract_features_for_paths(extractor, kinect_paths, exo_bbx, args.feature_chunk, "exo HMR2 features")
+        exo_features = _extract_features_for_paths(extractor, kinect_paths, exo_bbx, args.feature_chunk, "exo interactee HMR2 features")
         _save(out_dir / "features_exo_hmr2.pt", {"features": exo_features, "bbx_xys": exo_bbx, "image_paths": [str(p) for p in kinect_paths]})
         manifest["mask"]["features_exo"] = torch.ones(len(frame_ids), dtype=torch.bool)
+        exo_wearer_features = _extract_features_for_paths(extractor, kinect_paths, ego_bbx, args.feature_chunk, "exo wearer HMR2 features")
+        _save(out_dir / "features_exo_wearer_hmr2.pt", {"features": exo_wearer_features, "bbx_xys": ego_bbx, "image_paths": [str(p) for p in kinect_paths]})
+        manifest["mask"]["features_exo_wearer"] = torch.ones(len(frame_ids), dtype=torch.bool)
         ego_full_features = _extract_features_for_paths(extractor, pv_paths, manifest["bbx_ego_full"], args.feature_chunk, "ego full HMR2 features")
         _save(out_dir / "features_ego_full_hmr2.pt", {"features": ego_full_features, "bbx_xys": manifest["bbx_ego_full"], "image_paths": [str(p) for p in pv_paths]})
         manifest["mask"]["features_ego_full"] = torch.ones(len(frame_ids), dtype=torch.bool)
@@ -1028,6 +1064,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--skip-features", action="store_true")
     p.add_argument("--only-missing-ego-body-features", action="store_true", help="Append features_ego_body_hmr2.pt to existing preprocessing outputs")
+    p.add_argument("--only-missing-exo-wearer-features", action="store_true", help="Append features_exo_wearer_hmr2.pt for the camera wearer crop in exo/Kinect images")
     p.add_argument("--update-cpf-only", action="store_true", help="Only refresh camera_head_traj.pt CPF fields and metadata; do not recompute boxes/features")
     p.add_argument("--skip-debug", action="store_true")
     p.add_argument("--resume", action="store_true", help="Skip recordings whose expected outputs already exist")
@@ -1056,6 +1093,8 @@ def main() -> None:
                 _update_cpf_only(args)
             elif args.only_missing_ego_body_features:
                 _append_ego_body_features(args)
+            elif args.only_missing_exo_wearer_features:
+                _append_exo_wearer_features(args)
             else:
                 preprocess_recording(args)
         except Exception as exc:
